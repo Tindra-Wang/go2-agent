@@ -40,6 +40,7 @@ class StageConfig:
     num_actions = 12  # Go2 joint action dim / Go2 关节动作维度
     num_proprio_obs = 45  # proprioceptive obs dim / 本体感知观测维度
     num_scan = 256  # 16x16 height-scan dim / 16x16 高度扫描维度
+    num_goal_obs = 0  # optional goal observation dim / 可选 goal 观测维度
     num_critic_observations = 316  # proprio(45) + scan(256) + privileged(15)
 
     # --- Model architecture
@@ -56,6 +57,24 @@ class StageConfig:
     num_mini_batches = 4
     num_steps_per_env = 48
     min_normalized_std = [0.05, 0.02, 0.05] * 4
+    value_loss_coef = 1.0
+    cost_value_loss_coef = 1.0
+    cost_violation_loss_coef = 1.0
+    entropy_coef = 0.01
+    desired_kl = 0.01
+    schedule = "adaptive"
+
+    # --- Constrained PPO cost settings
+    # 受约束 PPO cost 配置 ---
+    num_costs = 1
+    cost_limit = 0.0  # Deprecated in algorithm path; kept only as scalar shorthand for cost_d_values.
+    cost_d_values = [0.0]
+    initial_penalty_weight = 0.1
+    penalty_lr = 0.05
+    penalty_decay = 1.0
+    penalty_max = 1.0
+    require_explicit_costs = False
+    termination_as_cost = True
 
     # --- Saving
     # 保存 ---
@@ -117,6 +136,23 @@ class Config:
     # Switch stage by changing CURRENT
     # 通过修改 CURRENT 切换阶段
     CURRENT = LocomotionConfig
+
+    @staticmethod
+    def resolve_cost_thresholds(stage):
+        """Resolve algorithm-facing cost thresholds from stage config."""
+        cost_d_values = getattr(stage, "cost_d_values", None)
+        if cost_d_values is None or len(cost_d_values) == 0:
+            cost_limit = float(getattr(stage, "cost_limit", 0.0))
+            return [cost_limit] * int(stage.num_costs)
+
+        resolved = [float(value) for value in cost_d_values]
+        if len(resolved) == 1 and int(stage.num_costs) > 1:
+            resolved = resolved * int(stage.num_costs)
+        if len(resolved) != int(stage.num_costs):
+            raise ValueError(
+                f"Stage '{stage.name}' expected {stage.num_costs} cost_d_values, got {len(resolved)}"
+            )
+        return resolved
 
     @staticmethod
     def load_conf(logger):
