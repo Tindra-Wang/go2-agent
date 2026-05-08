@@ -15,21 +15,23 @@ def build_monitor():
     # This function is used to create monitoring panel configurations for custom indicators.
     # 该函数用于创建自定义指标的监控面板配置。
     #
-    # Note: this builder only keeps metrics that are unique to algorithm training
-    # (loss-series metrics, episode_reward, track traversal progress).
-    # Other reward_* metrics (velocity tracking, posture, gait, navigation rewards, etc.)
-    # are rendered by the project-side tools/conf/monitor_default.yaml and
-    # tools/conf/monitor_default_track.yaml, and are no longer redefined here,
-    # to avoid duplicated panels with the same name in the final merged dashboard.
+    # Note: this builder keeps algorithm-only metrics (loss-series, rollout aggregates)
+    # plus locomotion reward panels aligned with ``train_env_conf_standard_locomotion.toml``.
+    # Project-side defaults may also define ``reward_*`` panels; if merged dashboards show
+    # duplicate names, dedupe in deployment yaml or trim one side.
     #
-    # 注意：本 builder 只保留算法训练独有的指标（loss 类、episode_reward、赛道穿越进度）。
-    # 其余 reward_* 指标（速度跟踪、姿态、步态、导航奖励等）由项目侧
-    # tools/conf/monitor_default.yaml 与 tools/conf/monitor_default_track.yaml 负责展示，
-    # 这里不再重复定义，避免最终合并后的监控面板出现同名指标重复绘制。
+    # 注意：本 builder 保留算法独有指标（loss、滚动统计），并补充标准 locomotion 配置中的
+    # ``reward_*`` 面板。若与项目侧 yaml 合并后出现同名指标，可在部署侧去重或删减一侧。
     #
     # Extra DIY-only panels: constrained-PPO / NP3O-style losses and rollout stats from
     # ``agent_diy/algorithm/algorithm.py`` and ``agent_diy/workflow/train_workflow.py``.
     # 额外 DIY 面板：约束 PPO 损失与 workflow 滚动统计，便于观察收敛与安全约束。
+    #
+    # Locomotion reward panels below mirror ``train_env_conf_standard_locomotion.toml``
+    # episode sums (``reward_<term>``). Add panels here so NP3O-aligned tuning is
+    # visible even when project-side yaml defaults are absent or merged differently.
+    # 下方 locomotion 奖励面板与标准配置中的回合汇总 ``reward_<term>`` 对齐；
+    # 便于在无默认 yaml 或合并顺序不同时仍能观察 NP3O 风格调参。
 
     Returns:
         dict: monitor configuration dictionary
@@ -267,14 +269,233 @@ def build_monitor():
         .end_panel()
         .end_group()
         # ==============================================================
-        # Group 4: Reward metrics (examples, players can add more reward panels as needed)
-        # Group 4: Reward 指标（示例，选手可按需补充更多 reward 面板）
+        # Group 4–8: Locomotion reward episode means (standard_locomotion.toml)
+        # Group 4–8：标准 locomotion 奖励回合均值（与 TOML 中启用的项对应）
         # ==============================================================
-        .add_group(group_name="奖励指标", group_name_en="reward")
-        .add_panel(name="线速度跟踪奖励", name_en="reward_track_lin_vel_xy", type="line")
-            .add_metric(metrics_name="reward_track_lin_vel_xy",
-                        expr="avg(reward_track_lin_vel_xy{})")
-            .end_panel()
+        .add_group(
+            group_name="奖励速度跟踪",
+            group_name_en="reward_tracking",
+        )
+        .add_panel(
+            name="线速度跟踪奖励",
+            name_en="reward_track_lin_vel_xy",
+            type="line",
+        )
+        .add_metric(
+            metrics_name="reward_track_lin_vel_xy",
+            expr="avg(reward_track_lin_vel_xy{})",
+        )
+        .end_panel()
+        .add_panel(
+            name="角速度跟踪奖励",
+            name_en="reward_track_ang_vel_z",
+            type="line",
+        )
+        .add_metric(
+            metrics_name="reward_track_ang_vel_z",
+            expr="avg(reward_track_ang_vel_z{})",
+        )
+        .end_panel()
+        .end_group()
+        .add_group(
+            group_name="奖励姿态与上坡",
+            group_name_en="reward_posture_uphill",
+        )
+        .add_panel(
+            name="线速度Z惩罚直立门控",
+            name_en="reward_lin_vel_z_up",
+            type="line",
+        )
+        .add_metric(
+            metrics_name="reward_lin_vel_z_up",
+            expr="avg(reward_lin_vel_z_up{})",
+        )
+        .end_panel()
+        .add_panel(
+            name="角速度XY惩罚直立门控",
+            name_en="reward_ang_vel_xy_up",
+            type="line",
+        )
+        .add_metric(
+            metrics_name="reward_ang_vel_xy_up",
+            expr="avg(reward_ang_vel_xy_up{})",
+        )
+        .end_panel()
+        .add_panel(
+            name="姿态偏离惩罚直立门控",
+            name_en="reward_orientation_up",
+            type="line",
+        )
+        .add_metric(
+            metrics_name="reward_orientation_up",
+            expr="avg(reward_orientation_up{})",
+        )
+        .end_panel()
+        .add_panel(
+            name="上坡正向激励",
+            name_en="reward_upward",
+            type="line",
+        )
+        .add_metric(
+            metrics_name="reward_upward",
+            expr="avg(reward_upward{})",
+        )
+        .end_panel()
+        .add_panel(
+            name="基座高度跟踪惩罚",
+            name_en="reward_correct_base_height",
+            type="line",
+        )
+        .add_metric(
+            metrics_name="reward_correct_base_height",
+            expr="avg(reward_correct_base_height{})",
+        )
+        .end_panel()
+        .end_group()
+        .add_group(
+            group_name="奖励步态与楼梯",
+            group_name_en="reward_gait_stairs",
+        )
+        .add_panel(
+            name="脚部滞空时间奖励",
+            name_en="reward_feet_air_time",
+            type="line",
+        )
+        .add_metric(
+            metrics_name="reward_feet_air_time",
+            expr="avg(reward_feet_air_time{})",
+        )
+        .end_panel()
+        .add_panel(
+            name="髋关节回默认惩罚",
+            name_en="reward_hip_to_default",
+            type="line",
+        )
+        .add_metric(
+            metrics_name="reward_hip_to_default",
+            expr="avg(reward_hip_to_default{})",
+        )
+        .end_panel()
+        .add_panel(
+            name="摆动腿高度惩罚楼梯",
+            name_en="reward_feet_height_body",
+            type="line",
+        )
+        .add_metric(
+            metrics_name="reward_feet_height_body",
+            expr="avg(reward_feet_height_body{})",
+        )
+        .end_panel()
+        .end_group()
+        .add_group(
+            group_name="奖励能耗与平滑",
+            group_name_en="reward_energy_smooth",
+        )
+        .add_panel(
+            name="能耗惩罚",
+            name_en="reward_energy",
+            type="line",
+        )
+        .add_metric(
+            metrics_name="reward_energy",
+            expr="avg(reward_energy{})",
+        )
+        .end_panel()
+        .add_panel(
+            name="动作二阶平滑惩罚",
+            name_en="reward_action_smoothness",
+            type="line",
+        )
+        .add_metric(
+            metrics_name="reward_action_smoothness",
+            expr="avg(reward_action_smoothness{})",
+        )
+        .end_panel()
+        .add_panel(
+            name="脚部接触力惩罚",
+            name_en="reward_feet_contact_forces",
+            type="line",
+        )
+        .add_metric(
+            metrics_name="reward_feet_contact_forces",
+            expr="avg(reward_feet_contact_forces{})",
+        )
+        .end_panel()
+        .end_group()
+        .add_group(
+            group_name="奖励关节与其他",
+            group_name_en="reward_joint_misc",
+        )
+        .add_panel(
+            name="关节加速度惩罚",
+            name_en="reward_joint_acc",
+            type="line",
+        )
+        .add_metric(
+            metrics_name="reward_joint_acc",
+            expr="avg(reward_joint_acc{})",
+        )
+        .end_panel()
+        .add_panel(
+            name="关节扭矩惩罚",
+            name_en="reward_joint_torques",
+            type="line",
+        )
+        .add_metric(
+            metrics_name="reward_joint_torques",
+            expr="avg(reward_joint_torques{})",
+        )
+        .end_panel()
+        .add_panel(
+            name="关节位置极限惩罚",
+            name_en="reward_dof_pos_limits",
+            type="line",
+        )
+        .add_metric(
+            metrics_name="reward_dof_pos_limits",
+            expr="avg(reward_dof_pos_limits{})",
+        )
+        .end_panel()
+        .add_panel(
+            name="动作变化率惩罚",
+            name_en="reward_action_rate",
+            type="line",
+        )
+        .add_metric(
+            metrics_name="reward_action_rate",
+            expr="avg(reward_action_rate{})",
+        )
+        .end_panel()
+        .add_panel(
+            name="非期望接触惩罚",
+            name_en="reward_undesired_contacts",
+            type="line",
+        )
+        .add_metric(
+            metrics_name="reward_undesired_contacts",
+            expr="avg(reward_undesired_contacts{})",
+        )
+        .end_panel()
+        .add_panel(
+            name="终止惩罚",
+            name_en="reward_termination",
+            type="line",
+        )
+        .add_metric(
+            metrics_name="reward_termination",
+            expr="avg(reward_termination{})",
+        )
+        .end_panel()
+        .add_panel(
+            name="到达目标奖励",
+            name_en="reward_reach_goal",
+            type="line",
+        )
+        .add_metric(
+            metrics_name="reward_reach_goal",
+            expr="avg(reward_reach_goal{})",
+        )
+        .end_panel()
         .end_group()
         .build()
     )

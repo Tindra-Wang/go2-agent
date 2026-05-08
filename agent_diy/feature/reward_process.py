@@ -10,6 +10,43 @@ import torch
 
 from tools.base_env.base_reward import RewardProcessBase
 
+try:
+    from isaaclab.utils.math import quat_rotate_inverse as _isaac_quat_rotate_inverse
+except Exception:
+    _isaac_quat_rotate_inverse = None
+
+
+def _quat_rotate_inverse(q: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """Rotate world-frame vectors into body frame using inverse quaternion (wxyz).
+
+    ``q``: (N, 4) or (N, K, 4); ``v``: (N, 3) or (N, K, 3). Matches Isaac Lab convention.
+    """
+    if _isaac_quat_rotate_inverse is not None:
+        if v.ndim == 3:
+            n_env, k, _ = v.shape
+            q_e = q.unsqueeze(1).expand(n_env, k, 4).reshape(-1, 4)
+            v_e = v.reshape(-1, 3)
+            out = _isaac_quat_rotate_inverse(q_e, v_e)
+            return out.view(n_env, k, 3)
+        return _isaac_quat_rotate_inverse(q, v)
+
+    # Fallback: MIT legged_gym-style (wxyz), vector shape (M, 3)
+    if v.ndim == 3:
+        n_env, k, _ = v.shape
+        q_e = q.unsqueeze(1).expand(n_env, k, 4).reshape(-1, 4)
+        v_e = v.reshape(-1, 3)
+    else:
+        q_e, v_e = q, v
+    q_w = q_e[:, 0]
+    q_vec = q_e[:, 1:4]
+    a = v_e * (2.0 * q_w.unsqueeze(-1) ** 2 - 1.0)
+    b = torch.cross(q_vec, v_e, dim=-1) * q_w.unsqueeze(-1) * 2.0
+    c = q_vec * torch.sum(q_vec * v_e, dim=-1, keepdim=True) * 2.0
+    out = a - b + c
+    if v.ndim == 3:
+        return out.view(n_env, k, 3)
+    return out
+
 
 class RewardProcess(RewardProcessBase):
     """
@@ -350,6 +387,100 @@ class RewardProcess(RewardProcessBase):
         hip_idx = [0, 3, 6, 9]
         delta = asset.data.joint_pos[:, hip_idx] - asset.data.default_joint_pos[:, hip_idx]
         return torch.sum(torch.square(delta), dim=1)
+
+    def _reward_feet_height_body(
+        self,
+        command_name: str = "base_velocity",
+        target_height: float = -0.30,
+        tanh_mult: float = 2.0,
+    ):
+        """Penalize swing-foot height (body z) vs target; aligns Isaac Lab feet_height_body.
+
+        摆动腿在机体坐标系 z 与 ``target_height`` 的偏差；配合 tanh 饱和，利于楼梯抬脚。
+        仅在平面速度指令大于阈值时生效，与 ``feet_air_time`` 门控一致。
+        """
+        asset = self._get_robot_asset()
+        asset_cfg = self._get_foot_asset_cfg()
+        foot_ids = asset_cfg.body_ids
+        foot_pos_w = asset.data.body_pos_w[:, foot_ids, :]
+        root_pos = asset.data.root_pos_w[:, None, :]
+        rel_w = foot_pos_w - root_pos
+        q = asset.data.root_quat_w
+        rel_b = _quat_rotate_inverse(q, rel_w)
+        foot_z = rel_b[:, :, 2]
+        err = foot_z - target_height
+        penalty = torch.sum(torch.square(torch.tanh(err * tanh_mult)), dim=1)
+
+        cmd = self.env.command_manager.get_command(command_name)
+        moving = torch.norm(cmd[:, :2], dim=1) > 0.1
+        return penalty * moving.float()
+
+    def _reward_correct_base_height(self, target_height: float = 0.32):
+        """Penalize vertical offset of root from desired height above env origin.
+
+        基座高度相对环境原点 z 与 ``target_height`` 的平方误差；无射线时用简化近似。
+        """
+        asset = self._get_robot_asset()
+        z = asset.data.root_pos_w[:, 2]
+        if hasattr(self.env.scene, "env_origins") and self.env.scene.env_origins is not None:
+            z = z - self.env.scene.env_origins[:, 2]
+        return torch.square(z - target_height)
+
+    def _reward_energy(self):
+        """Mechanical power proxy: sum |tau * qdot| over joints (Isaac-style energy).
+
+        优先 ``applied_torque`` / ``joint_effort`` × ``joint_vel``；缺失则退化为关节速度平方和。
+        """
+        asset = self._get_robot_asset()
+        qd = asset.data.joint_vel
+        if hasattr(asset.data, "applied_torque") and asset.data.applied_torque is not None:
+            tau = asset.data.applied_torque
+        elif hasattr(asset.data, "joint_effort") and asset.data.joint_effort is not None:
+            tau = asset.data.joint_effort
+        else:
+            return torch.sum(torch.square(qd), dim=1)
+        return torch.sum(torch.abs(tau * qd), dim=1)
+
+    def _reward_action_smoothness(self):
+        """Second-order penalty on actions: ||a_t - 2 a_{t-1} + a_{t-2}||^2.
+
+        与 Isaac Lab / NP3O ``action_smoothness`` 一致；首步及 episode 首帧置零历史。
+        """
+        cur = self.env.action_manager.action
+        n_env = cur.shape[0]
+        if not hasattr(self, "_diy_smooth_prev") or self._diy_smooth_prev.shape != cur.shape:
+            z = torch.zeros_like(cur)
+            self._diy_smooth_prev = z.clone()
+            self._diy_smooth_prev2 = z.clone()
+            self._diy_smooth_ready = False
+
+        if not self._diy_smooth_ready:
+            self._diy_smooth_prev = cur.detach().clone()
+            self._diy_smooth_prev2 = cur.detach().clone()
+            self._diy_smooth_ready = True
+            return torch.zeros(n_env, device=cur.device, dtype=cur.dtype)
+
+        if hasattr(self.env, "episode_length_buf"):
+            ep = self.env.episode_length_buf.squeeze(-1) if self.env.episode_length_buf.ndim > 1 else self.env.episode_length_buf
+            first = ep <= 1
+            self._diy_smooth_prev[first] = cur[first].detach()
+            self._diy_smooth_prev2[first] = cur[first].detach()
+
+        penalty = torch.sum(torch.square(cur - 2.0 * self._diy_smooth_prev + self._diy_smooth_prev2), dim=1)
+        self._diy_smooth_prev2 = self._diy_smooth_prev.detach()
+        self._diy_smooth_prev = cur.detach()
+        return penalty
+
+    def _reward_feet_contact_forces(self, max_contact_force: float = 100.0):
+        """Penalize foot contact forces above ``max_contact_force`` (NP3O-style).
+
+        对足部接触力范数超过阈值的超出部分求和，抑制跺脚与硬着陆。
+        """
+        sensor_cfg = self._get_foot_sensor_cfg()
+        contact_sensor = self.env.scene.sensors[sensor_cfg.name]
+        f = contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids, :]
+        n = torch.norm(f, dim=-1)
+        return torch.sum(torch.clip(n - max_contact_force, min=0.0), dim=1)
 
     # 注：collision_up 等价行为可由 `[rewards.undesired_contacts]`（基类提供）+
     # `[rewards.flat_orientation]` 共同覆盖；本文件不再额外定义 `_reward_collision_up`，
