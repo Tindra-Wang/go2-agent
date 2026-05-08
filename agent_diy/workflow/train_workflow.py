@@ -36,6 +36,15 @@ DEFAULT_COST_EPISODE_KEYS = (
     "safety_cost",
 )
 
+_COST_SOURCE_TO_ID = {
+    "uninitialized": -1.0,
+    "unknown": -1.0,
+    "zeros": 0.0,
+    "infos[cost]": 1.0,
+    "infos[costs]": 2.0,
+    "termination_as_cost": 3.0,
+}
+
 
 def _initialize_training_state(env, agent, logger):
     usr_conf, usr_conf_file, is_eval, stage = Config.load_conf(logger)
@@ -178,6 +187,36 @@ def _collect_episode_metrics(ep_infos, reward_keys, device):
     return _aggregate_metrics(generic_metrics)
 
 
+def _to_monitor_float(value):
+    """Convert a monitor value to float when possible; return None otherwise."""
+    if isinstance(value, bool):
+        return float(value)
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 0:
+            return None
+        return float(value.float().mean().item())
+    return None
+
+
+def _sanitize_monitor_data(monitor_data, logger=None):
+    """Drop non-numeric monitor fields to avoid Prometheus type errors."""
+    sanitized = {}
+    dropped = []
+    for key, value in monitor_data.items():
+        converted = _to_monitor_float(value)
+        if converted is None:
+            dropped.append((key, type(value).__name__))
+            continue
+        sanitized[key] = converted
+
+    if dropped and logger is not None:
+        dropped_desc = ", ".join([f"{key}<{type_name}>" for key, type_name in dropped])
+        logger.warning(f"[DIY] Dropped non-numeric monitor fields: {dropped_desc}")
+    return sanitized
+
+
 def report_monitor_data(ep_infos, reward_keys, agent, monitor, episode, storage_stats=None):
     if monitor is None:
         return
@@ -189,14 +228,15 @@ def report_monitor_data(ep_infos, reward_keys, agent, monitor, episode, storage_
         monitor_data["reward_std"] = storage_stats.get("reward_std", 0.0)
         monitor_data["cost_mean"] = storage_stats.get("cost_mean", 0.0)
         monitor_data["violation_mean"] = storage_stats.get("violation_mean", 0.0)
-        monitor_data["cost_source"] = storage_stats.get("cost_source", "unknown")
+        cost_source = storage_stats.get("cost_source", "unknown")
+        monitor_data["cost_source_id"] = _COST_SOURCE_TO_ID.get(cost_source, 99.0)
 
     if ep_infos:
         metrics = _collect_episode_metrics(ep_infos, reward_keys, agent.device)
         monitor_data.update(metrics)
         monitor_data["episode_reward"] = sum(monitor_data.get(key, 0) for key in reward_keys)
 
-    monitor.put_data({os.getpid(): monitor_data})
+    monitor.put_data({os.getpid(): _sanitize_monitor_data(monitor_data, logger=agent.logger)})
 
 
 def _process_env_step_result(data, episode, logger):
@@ -259,6 +299,7 @@ def _derive_costs(infos, rewards, dones, agent):
     num_costs = agent.stage.num_costs
     costs = torch.zeros(num_envs, num_costs, dtype=torch.float32, device=agent.device)
     cost_source = "zeros"
+    cost_scale = float(getattr(agent.stage, "cost_scale", 1.0))
 
     if infos is None:
         if getattr(agent.stage, "require_explicit_costs", False):
@@ -267,6 +308,8 @@ def _derive_costs(infos, rewards, dones, agent):
 
     explicit_costs, explicit_source = _select_costs_from_infos(infos, num_envs, num_costs, agent.device)
     if explicit_costs is not None:
+        # 显式 cost 由环境给定,默认假定其已与 d_values 同尺度,不再额外缩放。
+        # Explicit costs from env are assumed to already be on the same scale as d_values; no extra scaling.
         return explicit_costs, explicit_source
 
     if getattr(agent.stage, "require_explicit_costs", False):
@@ -287,12 +330,14 @@ def _derive_costs(infos, rewards, dones, agent):
                 agent.logger.warning(
                     f"[DIY] Falling back to episode summary cost infos['episode']['{key}']; broadcasting scalar summary to all envs."
                 )
-                costs[:, 0] = torch.clamp(metric.view(-1)[0], min=0.0)
+                # 派生 cost 乘以 cost_scale,使每步量级对齐 NP3O 的 cost*dt。
+                # Scale derived costs by cost_scale to align per-step magnitude with NP3O's `cost*dt`.
+                costs[:, 0] = torch.clamp(metric.view(-1)[0], min=0.0) * cost_scale
                 return costs, f"episode[{key}]"
 
     if agent.stage.termination_as_cost:
         agent.logger.warning("[DIY] Falling back to termination_as_cost because explicit per-env cost tensors were not found.")
-        costs[:, 0] = dones.float().view(-1)
+        costs[:, 0] = dones.float().view(-1) * cost_scale
         return costs, "termination_as_cost"
 
     return costs, cost_source
@@ -339,7 +384,15 @@ def _update_transition_data(
     if "time_outs" in infos:
         timeout_mask = infos["time_outs"].unsqueeze(1).to(agent.device)
         transition.rewards += agent.algorithm.gamma * torch.squeeze(transition.values * timeout_mask, 1)
-        transition.costs += agent.algorithm.gamma * transition.costs * timeout_mask
+        # Bootstrap cost on truncation. "value" 用 cost_values 自举(类奖励路径,推荐),
+        # "self" 复刻 NP3O 原版 costs += gamma * costs * timeout 行为,便于做对照实验。
+        bootstrap_mode = getattr(agent.stage, "timeout_cost_bootstrap", "value")
+        if bootstrap_mode == "value":
+            transition.costs = transition.costs + agent.algorithm.gamma * transition.cost_values * timeout_mask
+        elif bootstrap_mode == "self":
+            transition.costs = transition.costs + agent.algorithm.gamma * transition.costs * timeout_mask
+        else:
+            raise ValueError(f"Unknown timeout_cost_bootstrap: {bootstrap_mode}")
 
 
 def _update_episode_statistics(

@@ -83,6 +83,8 @@ class Agent(BaseAgent):
             penalty_lr=stage.penalty_lr,
             penalty_decay=stage.penalty_decay,
             penalty_max=stage.penalty_max,
+            penalty_mode=getattr(stage, "penalty_mode", "scheduled"),
+            penalty_growth_rate=getattr(stage, "penalty_growth_rate", 1.0004),
         )
         self.algorithm.init_storage(
             self.num_envs,

@@ -281,6 +281,80 @@ class RewardProcess(RewardProcessBase):
         """
         return torch.ones(self.env.num_envs, device=self.env.device)
 
+    # -----------------------------------------------------------------------
+    # NP3O-style gait & uphill rewards
+    # NP3O 风格的步态/上坡奖励
+    # -----------------------------------------------------------------------
+    #
+    # 设计要点（参考 LocomotionWithNP3O/envs/legged_robot.py / configs/go2_constraint_him.py）:
+    # 1. `_reward_upward` 用 `1 - projected_gravity_z` 给"机身仰角"正向回报，
+    #    pyramid_slope_inv / pyramid_stairs_inv 等上坡地形会显著触发，直接修复
+    #    "上坡/上楼梯训练不到位"的问题；
+    # 2. `*_up` 系列（lin_vel_z_up / ang_vel_xy_up / orientation_up / collision_up
+    #    / stumble_up / feet_slide_up）都用 `clamp(-projected_gravity_z, 0, 1)`
+    #    作为门控，仅在大致直立时才惩罚，避免上坡时被动姿态被过度惩罚导致 agent
+    #    干脆"挂机不动"；
+    # 3. `_reward_feet_air_time` 已存在，配合 `_reward_hip_to_default` 抑制
+    #    "小碎步 / 外八"步态。
+    # -----------------------------------------------------------------------
+
+    def _reward_upward(self):
+        """Reward upright body during slope/stair climbing (1 - g_z).
+
+        机身仰起时给正奖励，鼓励上坡/上楼梯主动抬身。
+        平地时 ``projected_gravity_b[:, 2] ≈ -1``，奖励 ≈ 2；
+        身体下倾（下坡或趴地）时奖励减小甚至为零。
+        """
+        asset = self._get_robot_asset()
+        return 1.0 - asset.data.projected_gravity_b[:, 2]
+
+    def _upright_gate(self):
+        """Gating coefficient: 1 when robot is upright, 0 when severely tilted.
+
+        上身姿态门控系数：直立时为 1，严重倾倒时为 0，用于 NP3O `*_up` 系列。
+        """
+        asset = self._get_robot_asset()
+        return torch.clamp(-asset.data.projected_gravity_b[:, 2], 0.0, 1.0)
+
+    def _reward_lin_vel_z_up(self):
+        """Penalize vertical linear velocity, gated by upright posture.
+
+        惩罚 z 方向跳动，仅在直立时生效；上坡 pitch 大时不再过罚，避免挂机。
+        """
+        asset = self._get_robot_asset()
+        return torch.square(asset.data.root_lin_vel_b[:, 2]) * self._upright_gate()
+
+    def _reward_ang_vel_xy_up(self):
+        """Penalize pitch/roll angular velocity, gated by upright posture.
+
+        惩罚 pitch/roll 方向角速度，姿态严重倾倒时门控关闭。
+        """
+        asset = self._get_robot_asset()
+        return torch.sum(torch.square(asset.data.root_ang_vel_b[:, :2]), dim=1) * self._upright_gate()
+
+    def _reward_orientation_up(self):
+        """Penalize off-flat orientation, gated by upright posture.
+
+        姿态偏离水平的惩罚（NP3O orientation_up 等价项）。
+        """
+        asset = self._get_robot_asset()
+        return torch.sum(torch.square(asset.data.projected_gravity_b[:, :2]), dim=1) * self._upright_gate()
+
+    def _reward_hip_to_default(self):
+        """Penalize hip joints deviating from default angles.
+
+        惩罚髋关节偏离默认角度，抑制外八/碎步步态（NP3O `hip_pos` 思路）。
+        Go2 髋关节索引为 [0, 3, 6, 9]（FL/FR/RL/RR hip）。
+        """
+        asset = self._get_robot_asset()
+        hip_idx = [0, 3, 6, 9]
+        delta = asset.data.joint_pos[:, hip_idx] - asset.data.default_joint_pos[:, hip_idx]
+        return torch.sum(torch.square(delta), dim=1)
+
+    # 注：collision_up 等价行为可由 `[rewards.undesired_contacts]`（基类提供）+
+    # `[rewards.flat_orientation]` 共同覆盖；本文件不再额外定义 `_reward_collision_up`，
+    # 避免依赖私有 helper，保持 reward_process 仅扩展 NP3O 中本仓库未提供的项。
+
     # --- Termination penalty / 终止惩罚 ---
     def _reward_termination(self):
         """Penalize real failures (terminated AND NOT timed-out AND NOT goal-reached).

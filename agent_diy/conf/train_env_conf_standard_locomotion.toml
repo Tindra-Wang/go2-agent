@@ -129,9 +129,13 @@ resampling_time = [10.0, 10.0]
 [commands.limit]
 # Velocity command **hard limits** (curriculum may expand sampling range up to here).
 # 速度命令 **采样上限**（硬约束，curriculum 最多扩展到该范围）
-lin_vel_x = [-2.0, 2.0]
-lin_vel_y = [-1.5, 1.5]
-ang_vel_z = [-1.5, 1.5]
+# 参考 NP3O Go2ConstraintHimRoughCfg.commands.ranges：上限收敛到 ~1m/s，
+# 避免 curriculum 把目标速度推到 2m/s 让机器人完全跟不上、tracking 长期 ≈ 0。
+# Reference NP3O: clamp the hard upper bound around 1 m/s so the curriculum
+# does not drift to unreachable targets that drown the tracking signal.
+lin_vel_x = [-1.0, 1.0]
+lin_vel_y = [-0.6, 0.6]
+ang_vel_z = [-1.0, 1.0]
 
 [commands.ranges]
 # Velocity command **initial sampling ranges** (expand towards limit when curriculum is enabled).
@@ -173,15 +177,28 @@ command_name = "base_velocity"
 
 # --- Negative: base stability ---
 # --- 负向：基座稳定 ---
-[rewards.lin_vel_z]
-# Penalty on vertical linear velocity.
-# Z 方向线速度惩罚（抑制上下跳跃）
+# 参考 NP3O：换成 *_up gated 版本，仅在直立时惩罚；
+# 上坡(pyramid_*_inv) 时机身天然 pitch 大，原本无门控的 lin_vel_z / ang_vel_xy /
+# flat_orientation 会大幅累积负奖励，导致 agent 学到“在斜坡上挂机不动”的退化策略。
+# Replace ungated penalties with NP3O-style `*_up` rewards that gate by upright
+# posture, so uphill terrains do not over-penalize and stall learning.
+[rewards.lin_vel_z_up]
+# Vertical linear velocity penalty, gated by upright posture.
+# Z 方向线速度惩罚（直立门控版）
 weight = -2.0
 
-[rewards.ang_vel_xy]
-# Penalty on pitch/roll angular velocity.
-# X/Y 方向角速度惩罚（抑制 pitch/roll 抖动）
+[rewards.ang_vel_xy_up]
+# Pitch/roll angular velocity penalty, gated by upright posture.
+# X/Y 方向角速度惩罚（直立门控版）
 weight = -0.05
+
+# --- Positive: incentivize uphill / 上坡正向激励 ---
+# 直接修复“pyramid_slope_inv / pyramid_stairs_inv 学不上去”的问题：
+# `1 - projected_gravity_z` 在机身仰起时 > 0，给上坡 / 上楼梯一个明确的正激励。
+# Directly addresses poor performance on inv terrains: rewards the agent for
+# tilting upright into a slope/stair rather than refusing to climb.
+[rewards.upward]
+weight = 0.5
 
 # --- Negative: joint smoothness ---
 # --- 负向：关节 ---
@@ -216,12 +233,39 @@ weight = -1.0
 # 触发阈值：被罚前允许的最大接触数
 threshold = 1
 
-# --- Extra: anti-tipping ---
-# --- 额外：防倾倒 ---
-[rewards.flat_orientation]
-# Penalty on deviation from flat base orientation.
-# 基座偏离水平姿态的惩罚
-weight = -1.5
+# --- Extra: anti-tipping (NP3O orientation_up 版本，斜坡门控) ---
+# --- 额外：防倾倒（NP3O orientation_up 版本，斜坡上自动放宽）---
+# 用 *_up 替换原 flat_orientation，避免上坡天然的 pitch 被过度惩罚。
+# Replace ungated `flat_orientation` with gated `orientation_up`.
+[rewards.orientation_up]
+weight = -1.0
+
+# --- Gait: long stride to suppress mincing steps ---
+# --- 步态：奖励长步幅，抑制小碎步 ---
+# `feet_air_time` 仅在指令速度 > 0.1 m/s 时生效，配合下面的 hip_to_default，
+# 显式塑造 trot/有力步态，对应 NP3O 中 feet_air_time(threshold=0.5)。
+# Activates the long-stride reward to break the "mincing" gait pattern.
+[rewards.feet_air_time]
+weight = 0.5
+[rewards.feet_air_time.params]
+command_name = "base_velocity"
+threshold = 0.5
+
+# --- Gait: keep hips close to default ---
+# --- 步态：髋关节回中（抑制外八/碎步）---
+# 对齐 NP3O hip_pos：仅约束 4 个 hip joint 偏离默认角度。
+# Mirrors NP3O `hip_pos`: penalize deviation only on the 4 hip joints.
+[rewards.hip_to_default]
+weight = -0.05
+
+# --- Termination: explicit fall penalty ---
+# --- 终止惩罚：明确"摔了就疼"---
+# 当前配置摔倒只是早结束，没有显式负奖励，agent 学不到"避免摔倒"的偏好；
+# 加一个 termination 罚分让早期学习有方向。
+# Without a termination penalty, the agent has no explicit signal to avoid
+# falls, which compounds the "stand still on hard terrain" failure mode.
+[rewards.termination]
+weight = -1.0
 
 [rewards.reach_goal]
 # Reach-goal reward example (active only when env.goal_positions is maintained, i.e. track terrain).

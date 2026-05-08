@@ -45,6 +45,8 @@ class Algorithm:
         penalty_lr: float = 0.05,
         penalty_decay: float = 1.0,
         penalty_max: float = 1.0,
+        penalty_mode: str = "scheduled",
+        penalty_growth_rate: float = 1.0004,
         **kwargs,
     ):
         self.device = device
@@ -71,6 +73,11 @@ class Algorithm:
         self.penalty_lr = penalty_lr
         self.penalty_decay = penalty_decay
         self.penalty_max = penalty_max
+        if penalty_mode not in {"scheduled", "adaptive"}:
+            raise ValueError(f"Unknown penalty_mode: {penalty_mode}")
+        self.penalty_mode = penalty_mode
+        self.penalty_growth_rate = float(penalty_growth_rate)
+        self.penalty_iter = 0
 
         stage = Config.CURRENT
         self.num_costs = stage.num_costs
@@ -238,7 +245,9 @@ class Algorithm:
         for key in mean_metrics:
             mean_metrics[key] /= num_updates
 
-        if applied_updates > 0:
+        if self.penalty_mode == "scheduled":
+            self._update_penalty_scheduled()
+        elif applied_updates > 0:
             self._update_penalty(mean_penalty_signal / applied_updates)
         mean_metrics["k_value_mean"] = self.k_value.mean().item()
         mean_metrics["k_value_max"] = self.k_value.max().item()
@@ -319,6 +328,17 @@ class Algorithm:
         bounded_signal = torch.nan_to_num(mean_penalty_signal, nan=0.0, posinf=self.penalty_max, neginf=-self.penalty_max)
         next_k_value = self.k_value * self.penalty_decay + self.penalty_lr * bounded_signal
         self.k_value = torch.clamp(next_k_value, min=0.0, max=self.penalty_max)
+
+    def _update_penalty_scheduled(self):
+        """NP3O-style penalty schedule: k *= growth_rate ** iter, capped at penalty_max.
+
+        参考 ``LocomotionWithNP3O/algorithm/np3o.py::update_k_value``：每个外层迭代调用一次，
+        以 ``growth_rate ** iter`` 放大 k 值，并通过 penalty_max 上限截断。
+        """
+        self.penalty_iter += 1
+        scale = torch.tensor(self.penalty_growth_rate ** self.penalty_iter, device=self.device, dtype=self.k_value.dtype)
+        max_t = torch.full_like(self.k_value, self.penalty_max)
+        self.k_value = torch.minimum(max_t, self.k_value * scale)
 
     def _update_learning_rate(self, mu_batch, sigma_batch, old_mu_batch, old_sigma_batch):
         if self.desired_kl is None or self.schedule != "adaptive":

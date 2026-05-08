@@ -68,11 +68,27 @@ class StageConfig:
     # 受约束 PPO cost 配置 ---
     num_costs = 1
     cost_limit = 0.0  # Deprecated in algorithm path; kept only as scalar shorthand for cost_d_values.
+    # cost_d_values 与 (1-gamma) * cost_return 同尺度；参考 NP3O 默认 0.0，
+    # 每步 cost 期望已乘以 cost_scale，相当于 NP3O 中的 cost * dt。
+    # cost_d_values shares scale with (1-gamma) * cost_return; 0.0 mirrors NP3O default
+    # because per-step costs are pre-scaled by cost_scale (≈ control dt).
     cost_d_values = [0.0]
+    # cost_scale ≈ NP3O `cost * dt`(0.02) 的等价系数,使派生 cost 与 d_values 同尺度。
+    # cost_scale matches NP3O's `cost * dt` (0.02) so derived costs stay on the same scale as d_values.
+    cost_scale = 0.02
     initial_penalty_weight = 0.1
+    # penalty_mode: "scheduled" 为 NP3O 固定增长(默认), "adaptive" 为反馈式更新。
+    # penalty_mode: "scheduled" matches NP3O fixed growth (default); "adaptive" keeps prior feedback law.
+    penalty_mode = "scheduled"
+    penalty_growth_rate = 1.0004
     penalty_lr = 0.05
     penalty_decay = 1.0
     penalty_max = 1.0
+    # timeout_cost_bootstrap: "value" 用 cost_values 自举(类奖励路径,推荐),
+    # "self" 复刻 NP3O 原版 costs += gamma * costs * timeout 行为。
+    # timeout_cost_bootstrap: "value" bootstraps with cost_values (recommended, mirrors reward path),
+    # "self" replicates the original NP3O `costs += gamma * costs * timeout` behavior.
+    timeout_cost_bootstrap = "value"
     require_explicit_costs = False
     termination_as_cost = True
 
