@@ -66,16 +66,24 @@ class StageConfig:
 
     # --- Constrained PPO cost settings
     # 受约束 PPO cost 配置 ---
-    num_costs = 1
+    # 默认对齐 NP3O Go2ConstraintHimRoughCfg：3 个具名 cost(dof_pos_limits/torque_limit/dof_vel_limits)。
+    # Defaults align with NP3O 3 named costs.
+    num_costs = 3
+    cost_names = ["dof_pos_limits", "torque_limit", "dof_vel_limits"]
     cost_limit = 0.0  # Deprecated in algorithm path; kept only as scalar shorthand for cost_d_values.
     # cost_d_values 与 (1-gamma) * cost_return 同尺度；参考 NP3O 默认 0.0，
     # 每步 cost 期望已乘以 cost_scale，相当于 NP3O 中的 cost * dt。
     # cost_d_values shares scale with (1-gamma) * cost_return; 0.0 mirrors NP3O default
     # because per-step costs are pre-scaled by cost_scale (≈ control dt).
-    cost_d_values = [0.0]
+    cost_d_values = [0.0, 0.0, 0.0]
     # cost_scale ≈ NP3O `cost * dt`(0.02) 的等价系数,使派生 cost 与 d_values 同尺度。
     # cost_scale matches NP3O's `cost * dt` (0.02) so derived costs stay on the same scale as d_values.
     cost_scale = 0.02
+    # NP3O 软极限阈值：超过此比例的关节位置/速度/扭矩才计入 cost。
+    # NP3O soft-limit ratios: only joint pos/vel/torque beyond these ratios contribute to cost.
+    soft_dof_pos_limit = 0.9
+    soft_dof_vel_limit = 1.0
+    soft_torque_limit = 1.0
     initial_penalty_weight = 0.1
     # penalty_mode: "scheduled" 为 NP3O 固定增长(默认), "adaptive" 为反馈式更新。
     # penalty_mode: "scheduled" matches NP3O fixed growth (default); "adaptive" keeps prior feedback law.
@@ -90,7 +98,19 @@ class StageConfig:
     # "self" replicates the original NP3O `costs += gamma * costs * timeout` behavior.
     timeout_cost_bootstrap = "value"
     require_explicit_costs = False
-    termination_as_cost = True
+    termination_as_cost = False  # 多代价路径下默认禁用单代价兜底；如需开启请在 stage override。
+    # 启用从 env 状态直接计算 NP3O 三具名 cost。
+    # Enable env-native computation of NP3O 3 named costs from robot state.
+    use_native_costs = True
+
+    # --- HIM-lite history encoder (NP3O actor history) ---
+    # 历史编码器（NP3O actor 端历史观测，HIM-lite，无 contrastive loss）
+    # 注：开启后 obs 维度增加 ``history_len * num_proprio_obs``，与 NP3O 行为对齐。
+    # When enabled, policy obs is augmented by ``history_len * num_proprio_obs`` dims.
+    use_history_encoder = True
+    history_len = 10  # NP3O Go2ConstraintHimRoughCfg.env.history_len
+    history_latent_dim = 16
+    history_encoder_dims = [128, 64]
 
     # --- Saving
     # 保存 ---

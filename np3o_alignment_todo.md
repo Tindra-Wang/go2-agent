@@ -35,20 +35,27 @@
 
 ## P2: architecture and observation parity work
 
-- [ ] Decide whether to stay NP3O-lite or move toward full NP3O/HIM architecture.
-  - Current local model is still simple actor/critic/cost-critic MLP in `agent_diy/model/model.py:35`.
-  - NP3O reference includes history encoder, teacher/student structure, privileged latent, imitation-related modules.
-  - Status: 暂保持 NP3O-lite（无 HIM 编码器/无 teacher-student/无 imi loss），改造工作量大且依赖多步 obs/历史采集、特权 critic 输入与 imitation 优化器，超出当前对齐迭代的 P0~P1 范围。等 P1 验证稳定后再启动。
+- [x] HIM-lite history encoder（actor 端）已落地。
+  - `agent_diy/model/model.py` 新增 `HistoryEncoder`：history_len*proprio → MLP → latent；actor 输入由 `[base, latent]` 拼接，critic / cost_critic 仍用未增广的 critic_obs（NP3O 对称：critic 是特权观测，不需要历史）。
+  - `agent_diy/agent.py` 通过 `stage.use_history_encoder/history_len/history_latent_dim/history_encoder_dims` 注入；评估端在 `Agent` 内自维护 `_eval_history` 并在 `exploit/reset` 中同步推进/清空，与训练端行为一致。
+  - `agent_diy/workflow/train_workflow.py` 维护 `history_buf`：每步用「时刻 t 的 raw proprio」推进，并对 dones 行清零；存入 `RolloutStorage` 的 obs 即为增广后的 actor 输入。
+  - 默认 `history_len=10` 对齐 NP3O `Go2ConstraintHimRoughCfg.env.history_len`；如需关闭设 `use_history_encoder=False` 即可回退。
 
-- [ ] Review observation parity with NP3O.
-  - Current policy obs path: `agent_diy/feature/policy_observation_process.py:9`.
-  - Current critic obs path: `agent_diy/feature/critic_observation_process.py:9`.
-  - Decide whether to add history features, privileged inputs, or scan/latent encoders.
-  - Status: 与 P2 模型项绑定，当前 obs 已对齐 Isaac Lab 默认 (proprio45+scan256+critic privileged)，缺历史拼接与 nav latent；建议随 HIM 改造一起规划。
+- [ ] HIM contrastive / estimator 损失（teacher-student、imi-loss、Barlow-Twins）。
+  - 仍未实现：NP3O `actor_student_backbone` 中的对比学习头与 imitation 优化器；当前为「end-to-end，无 contrastive loss」的 HIM-lite。
+  - 后续可按 NP3O `algorithm/np3o.py::imi_flag/imitation_learning_loss` 接入。
 
-- [ ] Decide whether to extend from single-cost to multi-cost constraints.
-  - Current local config still uses `num_costs = 1` in `agent_diy/conf/conf.py:67`.
-  - NP3O reference commonly uses multiple named costs.
+- [x] Observation parity：actor 端补齐历史；critic 端保持特权（lin_vel + effort）。
+  - 详见 P2.1。当前缺 nav latent / scan encoder，仍记为「NP3O-lite」。
+
+- [x] 多代价：3 具名 cost 已对齐 NP3O。
+  - `StageConfig.num_costs = 3`，`cost_names = ["dof_pos_limits", "torque_limit", "dof_vel_limits"]`，`cost_d_values = [0.0, 0.0, 0.0]`。
+  - `agent_diy/workflow/train_workflow.py::_compute_native_costs` 直接从 `env.scene["robot"].data` 计算三具名 cost：
+    - `dof_pos_limits = Σ clamp(超出 soft 极限的部分)`
+    - `torque_limit  = Σ clamp(|τ| - τ_lim*soft_τ, min=0)`
+    - `dof_vel_limits = Σ clamp(|q̇| - q̇_lim*soft_qd, min=0, max=1)`
+  - 由 `cost_scale ≈ 0.02` 缩放到与 NP3O `cost*dt` 同量级；显式 `infos['costs']` 优先级仍最高，env-native 次之，最后才走 termination/episode 兜底。
+  - `cost_source_id = 4.0` 对应 `env_native`，可在监控里直接观察是否走到了 NP3O 路径。
 
 ## P3: rollout / training loop parity
 

@@ -43,6 +43,7 @@ _COST_SOURCE_TO_ID = {
     "infos[cost]": 1.0,
     "infos[costs]": 2.0,
     "termination_as_cost": 3.0,
+    "env_native": 4.0,
 }
 
 
@@ -77,7 +78,22 @@ def _initialize_training_state(env, agent, logger):
         critic_obs = obs
     obs = torch.clone(obs)
     critic_obs = torch.clone(critic_obs)
-    logger.info(f"obs.shape:{obs.shape}, critic_obs.shape:{critic_obs.shape}")
+    logger.info(f"raw_obs.shape:{obs.shape}, critic_obs.shape:{critic_obs.shape}")
+
+    # 训练端 HIM 历史缓冲：(num_envs, history_len, proprio_dim)。
+    # Train-side HIM history buffer; reset rows on dones during the rollout.
+    history_buf = None
+    if getattr(agent, "history_len", 0) > 0:
+        history_buf = torch.zeros(
+            agent.num_envs,
+            agent.history_len,
+            agent.proprio_dim,
+            device=agent.device,
+            dtype=obs.dtype,
+        )
+        logger.info(
+            f"HIM history buffer enabled: history_len={agent.history_len}, proprio_dim={agent.proprio_dim}"
+        )
 
     reward_keys = load_reward_keys_from_monitor_config()
     logger.info(f"reward_keys list is {reward_keys}")
@@ -95,7 +111,25 @@ def _initialize_training_state(env, agent, logger):
         cur_episode_length,
         reward_keys,
         usr_conf,
+        history_buf,
     )
+
+
+def _augment_obs_with_history(obs, history_buf):
+    """Concatenate the flat history buffer onto the raw obs (NP3O HIM input)."""
+    if history_buf is None:
+        return obs
+    return torch.cat([obs, history_buf.flatten(1)], dim=-1)
+
+
+def _push_history(history_buf, raw_proprio, dones=None):
+    """Roll history buffer forward by one step; zero rows where ``dones`` is true."""
+    if history_buf is None:
+        return None
+    new_buf = torch.cat([history_buf[:, 1:], raw_proprio.detach().unsqueeze(1)], dim=1)
+    if dones is not None and dones.any():
+        new_buf[dones.bool()] = 0.0
+    return new_buf
 
 
 def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
@@ -115,6 +149,7 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
         cur_episode_length,
         reward_keys,
         usr_conf,
+        history_buf,
     ) = _initialize_training_state(env, agent, logger)
 
     last_obs, last_critic_obs = torch.clone(obs), torch.clone(critic_obs)
@@ -125,7 +160,7 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
         logger.info(f"Episode {episode} start, usr_conf is {usr_conf}")
         start_time = time.time()
 
-        last_obs, last_critic_obs, storage_stats = run_episodes_(
+        last_obs, last_critic_obs, history_buf, storage_stats = run_episodes_(
             env,
             agent,
             storage,
@@ -140,6 +175,7 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
             rewbuffer,
             costbuffer,
             lenbuffer,
+            history_buf,
         )
 
         episode += 1
@@ -294,7 +330,72 @@ def _select_costs_from_infos(infos, num_envs, num_costs, device):
     return None, None
 
 
-def _derive_costs(infos, rewards, dones, agent):
+def _try_get_robot_data(env):
+    """Best-effort access to the robot's ArticulationData; returns None on failure."""
+    try:
+        return env.scene["robot"].data
+    except Exception:
+        try:
+            return env.scene.articulations["robot"].data
+        except Exception:
+            return None
+
+
+def _compute_native_costs(env, agent):
+    """Compute NP3O 3 named costs (dof_pos_limits, torque_limit, dof_vel_limits).
+
+    Returns ``None`` if any required field is unavailable so callers can fall back.
+    完整复刻 ``LocomotionWithNP3O/envs/legged_robot.py`` 中三具名 cost 的计算口径，
+    并按 ``stage.cost_scale`` 缩放（≈ NP3O ``cost * dt``）。
+    """
+    data = _try_get_robot_data(env)
+    if data is None:
+        return None
+
+    soft_pos = float(getattr(agent.stage, "soft_dof_pos_limit", 0.9))
+    soft_tau = float(getattr(agent.stage, "soft_torque_limit", 1.0))
+    soft_qd = float(getattr(agent.stage, "soft_dof_vel_limit", 1.0))
+    cost_scale = float(getattr(agent.stage, "cost_scale", 1.0))
+
+    pos = getattr(data, "joint_pos", None)
+    pos_lim = getattr(data, "joint_pos_limits", None)
+    if pos is None or pos_lim is None:
+        return None
+    if pos_lim.ndim == 2:
+        pos_lim = pos_lim.unsqueeze(0).expand(pos.shape[0], -1, -1)
+    soft_low = pos_lim[..., 0] * soft_pos
+    soft_high = pos_lim[..., 1] * soft_pos
+    out_low = -(pos - soft_low).clip(max=0.0)
+    out_high = (pos - soft_high).clip(min=0.0)
+    cost_pos = (out_low + out_high).sum(dim=1)
+
+    tau = getattr(data, "applied_torque", None)
+    if tau is None:
+        tau = getattr(data, "joint_effort", None)
+    tau_lim = getattr(data, "joint_effort_limits", None)
+    if tau_lim is None:
+        tau_lim = getattr(data, "torque_limits", None)
+    if tau is None or tau_lim is None:
+        cost_torque = torch.zeros(pos.shape[0], device=pos.device, dtype=pos.dtype)
+    else:
+        if tau_lim.ndim == 1:
+            tau_lim = tau_lim.unsqueeze(0)
+        cost_torque = (tau.abs() - tau_lim * soft_tau).clip(min=0.0).sum(dim=1)
+
+    qd = getattr(data, "joint_vel", None)
+    qd_lim = getattr(data, "joint_vel_limits", None)
+    if qd is None or qd_lim is None:
+        cost_qd = torch.zeros(pos.shape[0], device=pos.device, dtype=pos.dtype)
+    else:
+        if qd_lim.ndim == 1:
+            qd_lim = qd_lim.unsqueeze(0)
+        cost_qd = (qd.abs() - qd_lim * soft_qd).clip(min=0.0, max=1.0).sum(dim=1)
+
+    costs = torch.stack([cost_pos, cost_torque, cost_qd], dim=-1) * cost_scale
+    return costs.to(device=agent.device, dtype=torch.float32)
+
+
+def _derive_costs(infos, rewards, dones, agent, env=None):
     num_envs = rewards.shape[0]
     num_costs = agent.stage.num_costs
     costs = torch.zeros(num_envs, num_costs, dtype=torch.float32, device=agent.device)
@@ -311,6 +412,21 @@ def _derive_costs(infos, rewards, dones, agent):
         # 显式 cost 由环境给定,默认假定其已与 d_values 同尺度,不再额外缩放。
         # Explicit costs from env are assumed to already be on the same scale as d_values; no extra scaling.
         return explicit_costs, explicit_source
+
+    # NP3O 多代价路径：直接从机器人状态计算 dof_pos_limits / torque_limit / dof_vel_limits。
+    # NP3O multi-cost path: compute the three named costs from the robot state.
+    if (
+        env is not None
+        and getattr(agent.stage, "use_native_costs", False)
+        and num_costs == 3
+        and list(getattr(agent.stage, "cost_names", [])) == ["dof_pos_limits", "torque_limit", "dof_vel_limits"]
+    ):
+        try:
+            native = _compute_native_costs(env, agent)
+            if native is not None and native.shape == (num_envs, num_costs):
+                return native, "env_native"
+        except Exception as e:
+            agent.logger.warning(f"[DIY] env-native cost computation failed: {e}; falling back.")
 
     if getattr(agent.stage, "require_explicit_costs", False):
         available_keys = sorted(infos.keys()) if isinstance(infos, dict) else []
@@ -459,6 +575,7 @@ def run_episodes_(
     rewbuffer,
     costbuffer,
     lenbuffer,
+    history_buf,
 ):
     transition = RolloutStorage.Transition()
     obs, critic_obs = last_obs, last_critic_obs
@@ -466,7 +583,10 @@ def run_episodes_(
 
     with torch.inference_mode():
         for i in range(agent.num_steps_per_env):
-            predict_result = agent.predict((obs, critic_obs))
+            # NP3O HIM：用当前历史拼接 raw obs 后再喂 actor；critic_obs 不需要历史。
+            # NP3O HIM: augment actor input with history; critic still uses raw critic_obs.
+            aug_obs = _augment_obs_with_history(obs, history_buf)
+            predict_result = agent.predict((aug_obs, critic_obs))
             (
                 actions,
                 values,
@@ -483,9 +603,17 @@ def run_episodes_(
                 logger.info(f"clipped_action:{command_actions}")
 
             data = env.step(command_actions)
-            frame_no, obs, critic_obs, rewards, dones, infos = _process_env_step_result(data, episode, logger)
-            costs, cost_source = _derive_costs(infos, rewards, dones, agent)
+            frame_no, next_obs, next_critic_obs, rewards, dones, infos = _process_env_step_result(data, episode, logger)
+            costs, cost_source = _derive_costs(infos, rewards, dones, agent, env=env)
             last_cost_source = cost_source
+
+            # 在 step 之后用「时刻 t 的 raw proprio」推进 history（即 obs 而非 next_obs），
+            # 并对 dones=True 的 env 行清零，使下一 episode 历史从零开始。
+            # Push the proprio at time t (the obs we acted on) into history; reset rows on dones.
+            if history_buf is not None:
+                proprio_t = obs[:, : agent.proprio_dim]
+                history_buf = _push_history(history_buf, proprio_t, dones=dones)
+            obs, critic_obs = next_obs, next_critic_obs
 
             obs, critic_obs, rewards, dones, costs = _move_tensors_to_device(
                 obs, critic_obs, rewards, dones, costs, agent.device
@@ -542,4 +670,4 @@ def run_episodes_(
         storage_stats = _compute_advantages_and_returns(storage, agent, critic_obs, logger, last_cost_source)
         last_obs = torch.clone(obs)
 
-    return last_obs, critic_obs, storage_stats
+    return last_obs, critic_obs, history_buf, storage_stats

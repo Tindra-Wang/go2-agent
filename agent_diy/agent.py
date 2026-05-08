@@ -44,9 +44,16 @@ class Agent(BaseAgent):
         self.num_envs = env_conf["num_envs"]
         self.num_actions = stage.num_actions
         self.num_critic_obs = stage.num_critic_observations
-        self.num_obs = stage.num_proprio_obs + stage.num_scan
+        self.proprio_dim = int(stage.num_proprio_obs)
+        self.base_num_obs = self.proprio_dim + int(stage.num_scan)
+        # 启用 HIM 历史编码器后，policy obs 末尾追加 history_len*proprio_dim 维历史。
+        # When the HIM history encoder is enabled, the policy obs is augmented with
+        # a trailing ``history_len * proprio_dim`` slice of past proprio observations.
+        self.history_len = int(getattr(stage, "history_len", 0)) if getattr(stage, "use_history_encoder", False) else 0
+        self.num_obs = self.base_num_obs + self.history_len * self.proprio_dim
         self.num_steps_per_env = stage.num_steps_per_env
         self.save_interval = stage.model_save_interval
+        self._eval_history = None
 
         self.model = Model(
             num_obs=self.num_obs,
@@ -56,6 +63,10 @@ class Agent(BaseAgent):
             critic_hidden_dims=stage.critic_hidden_dims,
             activation=stage.activation,
             num_costs=stage.num_costs,
+            history_len=self.history_len,
+            proprio_dim=self.proprio_dim,
+            history_latent_dim=int(getattr(stage, "history_latent_dim", 16)),
+            history_encoder_dims=list(getattr(stage, "history_encoder_dims", [128, 64])),
         ).to(self.device)
         self.model = self.model.to(memory_format=torch.channels_last)
 
@@ -122,10 +133,36 @@ class Agent(BaseAgent):
             critic_observations,
         )
 
+    def _augment_obs_for_eval(self, obs):
+        """Concatenate the eval-side history buffer onto the raw obs (HIM-lite eval path).
+
+        在评估路径下也维护历史观测，使评估时的 actor 输入与训练时一致；
+        若 ``history_len <= 0`` 则原样返回。
+        """
+        if self.history_len <= 0:
+            return obs
+        if (
+            self._eval_history is None
+            or self._eval_history.shape[0] != obs.shape[0]
+            or self._eval_history.device != obs.device
+        ):
+            self._eval_history = torch.zeros(
+                obs.shape[0], self.history_len, self.proprio_dim, device=obs.device, dtype=obs.dtype
+            )
+        return torch.cat([obs, self._eval_history.flatten(1)], dim=-1)
+
+    def _update_eval_history(self, raw_obs):
+        if self.history_len <= 0 or self._eval_history is None:
+            return
+        proprio = raw_obs[:, : self.proprio_dim].detach()
+        self._eval_history = torch.cat([self._eval_history[:, 1:], proprio.unsqueeze(1)], dim=1)
+
     def exploit(self, list_obs_data):
         obs = list_obs_data[0] if isinstance(list_obs_data, (list, tuple)) else list_obs_data
+        aug_obs = self._augment_obs_for_eval(obs)
         with torch.no_grad():
-            actions = self.algorithm.actor_critic.act_inference(obs)
+            actions = self.algorithm.actor_critic.act_inference(aug_obs)
+        self._update_eval_history(obs)
         return [ActData(action=actions)]
 
     def learn(self, list_sample_data=None):
@@ -143,6 +180,9 @@ class Agent(BaseAgent):
         return obs_q
 
     def reset(self):
+        # 评估端历史缓冲在 episode 切换时由调用方触发清理。
+        # Evaluation-side history is cleared by the caller across episode boundaries.
+        self._eval_history = None
         return None
 
     def save_model(self, path=None, id="1"):
