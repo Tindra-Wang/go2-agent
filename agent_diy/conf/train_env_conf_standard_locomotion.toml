@@ -52,7 +52,12 @@ curriculum = true
 
 # Max init difficulty tier for robot placement, valid range: [0, 9].
 # 机器人初始放置的最大难度档，合法范围：[0, 9]
-max_init_terrain_level = 5
+# 课程从 0 档起步：网络早期根本没学会走路，把它直接丢到难度 5（含 stairs / maze）
+# 会让前几百次 episode 全部摔死，外现就是 "开局挂机"。NP3O 默认从 0 起步，curriculum
+# 会按完成度自动晋级，难度学习曲线更平滑。
+# Start the curriculum at tier 0; jumping straight to tier 5 with stairs/maze
+# stalls early training (the well-known "stand still" warmup symptom).
+max_init_terrain_level = 0
 
 
 # Sub-terrain proportions (all proportions must sum to 1.0).
@@ -159,8 +164,12 @@ ang_vel_yaw = [-1.0, 1.0]
 
 # --- Positive: velocity tracking ---
 # --- 正向：速度跟踪 ---
+# NP3O Go2ConstraintHimRoughCfg 中 tracking_lin_vel = 2.0、tracking_ang_vel = 1.0；
+# 当前训练 forward 分提升缓慢，是因为主信号被其他 penalty 淹没，提权到接近 NP3O 比例。
+# Bring tracking weights closer to NP3O ratios so the velocity-tracking signal
+# dominates instead of being drowned by penalty terms.
 [rewards.track_lin_vel_xy]
-weight = 1.0
+weight = 1.5
 [rewards.track_lin_vel_xy.params]
 # Std of Gaussian kernel, controls how sharp the error → reward decay is.
 # 高斯核标准差，控制误差 → 奖励的衰减陡峭程度
@@ -170,7 +179,7 @@ std = 0.25
 command_name = "base_velocity"
 
 [rewards.track_ang_vel_z]
-weight = 0.5
+weight = 0.75
 [rewards.track_ang_vel_z.params]
 std = 0.25
 command_name = "base_velocity"
@@ -235,28 +244,70 @@ threshold = 1
 
 # --- Extra: anti-tipping (NP3O orientation_up 版本，斜坡门控) ---
 # --- 额外：防倾倒（NP3O orientation_up 版本，斜坡上自动放宽）---
-# 用 *_up 替换原 flat_orientation，避免上坡天然的 pitch 被过度惩罚。
-# Replace ungated `flat_orientation` with gated `orientation_up`.
+# NP3O 中 orientation_up 仅 -0.2；此前用 -1.0 是 5 倍过重，导致斜坡上 pose 持续下降
+# （agent 被迫学到"贴坡爬"等扭曲姿态去逃避 pitch 惩罚）。下调到 NP3O 同尺度。
+# NP3O uses orientation_up=-0.2; the previous -1.0 was 5x too strict and was the
+# root cause of the late-stage pose-score regression seen in training.
 [rewards.orientation_up]
-weight = -1.0
+weight = -0.2
 
 # --- Gait: long stride to suppress mincing steps ---
 # --- 步态：奖励长步幅，抑制小碎步 ---
-# `feet_air_time` 仅在指令速度 > 0.1 m/s 时生效，配合下面的 hip_to_default，
-# 显式塑造 trot/有力步态，对应 NP3O 中 feet_air_time(threshold=0.5)。
-# Activates the long-stride reward to break the "mincing" gait pattern.
+# 权重从 0.5 降到 0.25：原值过强导致 agent 拼命踢腿换大跨步，能耗显著上升、
+# energy_score 持续下降。0.25 仍能保留正向激励，又不至于把 tracking 信号挤掉。
+# Reduced from 0.5 to 0.25: too strong a stride bonus drives the agent to pump
+# torque and tanks the energy_score; 0.25 still encourages stride length safely.
 [rewards.feet_air_time]
-weight = 0.5
+weight = 0.25
 [rewards.feet_air_time.params]
 command_name = "base_velocity"
 threshold = 0.5
 
 # --- Gait: keep hips close to default ---
 # --- 步态：髋关节回中（抑制外八/碎步）---
-# 对齐 NP3O hip_pos：仅约束 4 个 hip joint 偏离默认角度。
-# Mirrors NP3O `hip_pos`: penalize deviation only on the 4 hip joints.
+# 权重从 -0.05 降到 -0.02：避免早期初始化时把 hip 锁住、影响探索导致开局挂机。
+# Soften hip-default constraint so it does not stifle exploration in early training.
 [rewards.hip_to_default]
+weight = -0.02
+
+# --- Gait: foot-clearance during swing (key for stairs) ---
+# --- 步态：摆动腿抬脚高度（楼梯关键奖励）---
+# 直接面向 pyramid_stairs / pyramid_stairs_inv 性能差的根因：当前 agent 贴地碎步走，
+# 一遇到台阶就被绊。`feet_height_body` 给摆动腿设定 body-frame z 目标（-0.30 m，
+# 越接近 0 抬腿越高），是 NP3O foot_clearance_up + Isaac Lab feet_height_body 的等价物。
+# Critical for stairs: enforces a body-frame z target for the swing foot so the
+# agent learns to actually lift its legs over step edges.
+[rewards.feet_height_body]
 weight = -0.05
+[rewards.feet_height_body.params]
+command_name = "base_velocity"
+target_height = -0.30
+tanh_mult = 2.0
+
+# --- Posture: keep base height (avoid duck-walking) ---
+# --- 姿态：维持基座高度，抑制"鸭步/趴地"---
+# pose_score 后期下降的另一推手是机身整体下沉；NP3O base_height_target = 0.32。
+# Mirrors NP3O `base_height_up`; prevents the duck-walking failure mode where the
+# robot collapses its hips to bypass `feet_height_body`.
+[rewards.correct_base_height]
+weight = -0.5
+[rewards.correct_base_height.params]
+target_height = 0.32
+
+# --- Energy / smoothness: cap power consumption ---
+# --- 能耗 / 平滑：限制功率消耗，避免 energy_score 持续下降 ---
+# `feet_air_time` 让 agent 倾向"使劲踢"，必须配合 energy / torque / smoothness
+# 类反馈才能学到"踢得对而非踢得猛"。这三项是基类内置 reward。
+# Couples with feet_air_time to shape "kick smart, not kick hard": addresses the
+# energy_score regression directly.
+[rewards.energy]
+weight = -2e-5
+
+[rewards.action_smoothness]
+weight = -0.005
+
+[rewards.feet_contact_forces]
+weight = -1.5e-4
 
 # --- Termination: explicit fall penalty ---
 # --- 终止惩罚：明确"摔了就疼"---
