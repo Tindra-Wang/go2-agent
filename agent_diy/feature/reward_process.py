@@ -377,16 +377,113 @@ class RewardProcess(RewardProcessBase):
         asset = self._get_robot_asset()
         return torch.sum(torch.square(asset.data.projected_gravity_b[:, :2]), dim=1) * self._upright_gate()
 
-    def _reward_hip_to_default(self):
-        """Penalize hip joints deviating from default angles.
+    # ----- Joint index helpers (IsaacLab Go2 joints are alphabetically grouped) -----
+    # IsaacLab Go2 关节顺序按"先类型后腿名"字典序排列：
+    #   [FL_hip, FR_hip, RL_hip, RR_hip,  FL_thigh, FR_thigh, RL_thigh, RR_thigh,
+    #    FL_calf, FR_calf, RL_calf, RR_calf]
+    # 这与 NP3O legged_gym 中"FR/FL/RR/RL × hip/thigh/calf"的索引完全不同；
+    # 旧实现里硬编码的 `[0,3,6,9]` 实际上等于 [FL_hip, RR_hip, FL_thigh, RR_thigh]，
+    # 既漏了一半 hip，又把 thigh 当成 hip 在罚——这是"挂机/外八/小碎步"训练
+    # 不收敛的隐藏 bug。这里改为按 joint name 动态映射，避免一次性踩同一个坑。
+    def _leg_joint_indices(self):
+        """Return cached dict {leg: {hip,thigh,calf}} mapped from joint_names.
 
-        惩罚髋关节偏离默认角度，抑制外八/碎步步态（NP3O `hip_pos` 思路）。
-        Go2 髋关节索引为 [0, 3, 6, 9]（FL/FR/RL/RR hip）。
+        按关节名解析每条腿的 hip/thigh/calf 索引，结果缓存在 ``self._leg_idx``。
+        """
+        if getattr(self, "_leg_idx", None) is not None:
+            return self._leg_idx
+        asset = self._get_robot_asset()
+        names = list(asset.data.joint_names)
+        idx = {leg: {} for leg in ("FL", "FR", "RL", "RR")}
+        for i, n in enumerate(names):
+            for leg in idx:
+                if n.startswith(leg + "_"):
+                    if "hip" in n:
+                        idx[leg]["hip"] = i
+                    elif "thigh" in n:
+                        idx[leg]["thigh"] = i
+                    elif "calf" in n:
+                        idx[leg]["calf"] = i
+        self._leg_idx = idx
+        return idx
+
+    def _reward_hip_to_default(self):
+        """Penalize hip joints deviating from default angles (NP3O ``hip_pos``).
+
+        惩罚四条腿的 hip 关节偏离 default，抑制"外八/碎步"步态。
+        关节索引按名字解析，不再硬编码（避免 IsaacLab 与 NP3O 顺序差异踩坑）。
         """
         asset = self._get_robot_asset()
-        hip_idx = [0, 3, 6, 9]
+        idx = self._leg_joint_indices()
+        hip_idx = [idx[leg]["hip"] for leg in ("FL", "FR", "RL", "RR")]
         delta = asset.data.joint_pos[:, hip_idx] - asset.data.default_joint_pos[:, hip_idx]
         return torch.sum(torch.square(delta), dim=1)
+
+    def _reward_has_contact(self, command_threshold: float = 0.1):
+        """NP3O ``has_contact``: reward all four feet on the ground when nearly idle.
+
+        cmd≈0 时奖励"4 脚触地的比例"。直接对治评测中"右后腿长期悬空"的退化解：
+        在低速指令下若一条腿没落地，本项就给不了满分，与 ``stand_nice`` 协同把
+        agent 拉回标准四脚站姿。
+
+        Args:
+            command_threshold: cmd 范数低于该值视为静止 / "stand still" gate.
+        """
+        sensor_cfg = self._get_foot_sensor_cfg()
+        contact_sensor = self.env.scene.sensors[sensor_cfg.name]
+        forces = contact_sensor.data.net_forces_w_history[:, :, sensor_cfg.body_ids, :]
+        contact = (forces.norm(dim=-1).max(dim=1)[0] > 1.0).float()
+        cmd = self.env.command_manager.get_command("base_velocity")
+        idle = (torch.norm(cmd[:, :2], dim=1) < command_threshold).float()
+        n_feet = max(1, contact.shape[1])
+        return idle * contact.sum(dim=1) / n_feet
+
+    def _reward_stand_nice(self, command_threshold: float = 0.1):
+        """NP3O ``stand_nice``: pull joints back to default when idle & upright.
+
+        在 cmd≈0 且姿态接近直立时，惩罚 |q - q_default|。直接处理"开局/中途挂机
+        在奇怪扭曲姿态"的现象——只要还在挂机就一直被罚，必须复位到标准站姿。
+        姿态门控用 ``1 - g_z``，倒地时不再继续累加惩罚。
+        """
+        asset = self._get_robot_asset()
+        cmd = self.env.command_manager.get_command("base_velocity")
+        idle = (torch.norm(cmd[:, :2], dim=1) < command_threshold).float()
+        upright = 1.0 - asset.data.projected_gravity_b[:, 2]
+        delta = torch.sum(torch.abs(asset.data.joint_pos - asset.data.default_joint_pos), dim=1)
+        return delta * upright * idle
+
+    def _reward_foot_mirror_up(self):
+        """NP3O ``foot_mirror_up``: enforce diagonal-leg symmetry (FL≈RR, FR≈RL).
+
+        对角腿对称：trot 步态下 FL 与 RR、FR 与 RL 应同相位、镜像姿态。
+        若一条腿（如右后）长期悬空 / 与对角腿姿态严重错位，本项会持续给负反馈。
+        姿态门控只在直立时生效，避免摔倒后继续累罚。
+        """
+        asset = self._get_robot_asset()
+        idx = self._leg_joint_indices()
+        q = asset.data.joint_pos
+        fl = [idx["FL"]["hip"], idx["FL"]["thigh"], idx["FL"]["calf"]]
+        fr = [idx["FR"]["hip"], idx["FR"]["thigh"], idx["FR"]["calf"]]
+        rl = [idx["RL"]["hip"], idx["RL"]["thigh"], idx["RL"]["calf"]]
+        rr = [idx["RR"]["hip"], idx["RR"]["thigh"], idx["RR"]["calf"]]
+        diff1 = torch.sum(torch.square(q[:, fl] - q[:, rr]), dim=-1)
+        diff2 = torch.sum(torch.square(q[:, fr] - q[:, rl]), dim=-1)
+        return 0.5 * self._upright_gate() * (diff1 + diff2)
+
+    def _reward_no_fly(self, command_threshold: float = 0.1):
+        """Penalize "fewer than 2 feet on ground" when commanded to move (anti-air).
+
+        移动时强制至少 2 足触地（trot 至少有一条对角触地），避免出现"三腿离地、
+        一条腿勉强支撑"或"右后腿干脆挂着不参与支撑"的退化步态。
+        """
+        sensor_cfg = self._get_foot_sensor_cfg()
+        contact_sensor = self.env.scene.sensors[sensor_cfg.name]
+        forces = contact_sensor.data.net_forces_w_history[:, :, sensor_cfg.body_ids, :]
+        contact = (forces.norm(dim=-1).max(dim=1)[0] > 1.0).float()
+        n_contact = contact.sum(dim=1)
+        cmd = self.env.command_manager.get_command("base_velocity")
+        moving = (torch.norm(cmd[:, :2], dim=1) >= command_threshold).float()
+        return ((n_contact < 2).float()) * moving
 
     def _reward_feet_height_body(
         self,

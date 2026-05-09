@@ -33,6 +33,28 @@
   - 增加 `timeout_cost_bootstrap` 配置：`"value"`(默认) 用 `cost_values * timeout_mask` 自举（与 reward 路径对称、更符合 GAE 截断处理）；`"self"` 复刻 NP3O 原版 `costs += gamma * costs * timeout` 行为以便对照。
   - 若环境给出与 NP3O 一致的“原始 cost+dt”，把该项设为 `"self"` 即可严格对齐参考实现。
 
+## P1.x: gait / idle reward parity (新增 — 评测中 "右后腿悬空 + 小碎步 + 挂机" 修复)
+
+- [x] 修复 `_reward_hip_to_default` 的关节索引硬编码 bug。
+  - 原实现沿用了 NP3O legged_gym 的 `[0, 3, 6, 9]`；但 IsaacLab Go2 关节是
+    "类型分组、字母排序"（hip 索引应是 `[0,1,2,3]`），实际之前在罚
+    `[FL_hip, RR_hip, FL_thigh, RR_thigh]` —— 既漏一半 hip，又把 thigh 当 hip 罚。
+  - 现改为按 `joint_names` 解析每条腿的 hip/thigh/calf 索引（`_leg_joint_indices`）。
+
+- [x] 新增 `_reward_has_contact`（对齐 NP3O `has_contact = 0.5`）。
+  - cmd≈0 时奖励"4 脚触地的比例"。直接对治"低速时某条腿长期悬空"。
+
+- [x] 新增 `_reward_stand_nice`（对齐 NP3O `stand_nice = -0.1`）。
+  - cmd≈0 且直立时持续惩罚 `|q - q_default|`，强制复位到标准站姿。
+  - 直接对治"开局/中途挂机在扭曲姿态、不痛不痒"。
+
+- [x] 新增 `_reward_foot_mirror_up`（对齐 NP3O `foot_mirror_up = -0.05`）。
+  - 对角腿镜像：`FL ≈ RR`、`FR ≈ RL`，trot 步态对称约束。
+  - 缺失该项时，agent 容易学出"右后腿不动、其它三腿小碎步"的非对称步态。
+
+- [x] 新增 `_reward_no_fly`（无 NP3O 直接对应，但同思路 anti-air 约束）。
+  - 移动指令下要求至少 2 足触地，cap 掉"3 腿离地、1 腿支撑"等极端步态。
+
 ## P2: architecture and observation parity work
 
 - [x] HIM-lite history encoder（actor 端）已落地。

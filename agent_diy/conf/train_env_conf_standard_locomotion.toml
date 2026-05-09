@@ -287,10 +287,53 @@ threshold = 0.5
 
 # --- Gait: keep hips close to default ---
 # --- 步态：髋关节回中（抑制外八/碎步）---
-# 权重从 -0.05 降到 -0.02：避免早期初始化时把 hip 锁住、影响探索导致开局挂机。
-# Soften hip-default constraint so it does not stifle exploration in early training.
+# 修复：原实现把硬编码索引 [0,3,6,9] 当成 hip，但 IsaacLab Go2 关节是按
+# "类型分组、字母排序"（hip 索引应是 [0,1,2,3]），实际上之前在罚 [FL_hip,
+# RR_hip, FL_thigh, RR_thigh] —— 既漏一半 hip，又把 thigh 当 hip 罚，
+# 极可能就是"右后腿姿态怪 / 小碎步"训练不掉的元凶。
+# 现在改为按 joint name 解析索引；权重适度恢复到 NP3O 量级 (-0.05)。
+# Bug fix: previous hardcoded indices were wrong for IsaacLab joint order;
+# joints are now resolved from joint_names (see reward_process.py).
 [rewards.hip_to_default]
-weight = -0.02
+weight = -0.05
+
+# --- Gait: diagonal-leg mirror symmetry (NP3O foot_mirror_up) ---
+# --- 步态：对角腿镜像（直接对治"右后腿悬空 / 步态不对称"）---
+# NP3O 中 `foot_mirror_up = -0.05`：FL≈RR、FR≈RL 的关节对称约束，trot 步态下
+# 是对角腿同相位的物理体现。这是当前评测中"右后腿长期悬空、其它腿小碎步"
+# 缺失的关键 shaping 信号。直立门控保留，倒地后不继续累罚。
+# Critical missing piece for the asymmetric-gait failure mode observed in eval.
+[rewards.foot_mirror_up]
+weight = -0.05
+
+# --- Gait: anti-air (require >=2 feet contact when moving) ---
+# --- 步态：反离地（移动中至少 2 足触地）---
+# 直接 cap 掉"3 腿离地、1 腿支撑"或"右后腿干脆不参与"的极端步态。
+# 移动门控避免与跳跃/起步阶段冲突。
+# Anti-air constraint to clamp the "floating leg" failure observed in eval.
+[rewards.no_fly]
+weight = -0.5
+[rewards.no_fly.params]
+command_threshold = 0.1
+
+# --- Idle: all four feet on the ground when commanded to stand (NP3O has_contact) ---
+# --- 静止：cmd≈0 时奖励四脚均触地（NP3O has_contact）---
+# 在低速指令下若一条腿未落地就拿不到满分，与 stand_nice 一起把 agent 拉回
+# 标准四脚站姿，直接处理"挂机时一条腿悬空"。
+[rewards.has_contact]
+weight = 0.5
+[rewards.has_contact.params]
+command_threshold = 0.1
+
+# --- Idle: pull joints back to default when standing & upright (NP3O stand_nice) ---
+# --- 静止：cmd≈0 + 直立时强制回 default 姿态（NP3O stand_nice）---
+# 直接对治"开局/中途挂机在扭曲姿态"：只要还在挂机就一直被罚 |q - q_default|，
+# 必须复位到标准站姿才能停止累计。倒地时门控关闭，避免摔倒后继续累罚。
+# Critical for the "freeze in odd pose" failure mode at start / mid-episode.
+[rewards.stand_nice]
+weight = -0.1
+[rewards.stand_nice.params]
+command_threshold = 0.1
 
 # --- Gait: foot-clearance during swing (key for stairs) ---
 # --- 步态：摆动腿抬脚高度（楼梯关键奖励）---
