@@ -52,11 +52,9 @@ curriculum = true
 
 # Max init difficulty tier for robot placement, valid range: [0, 9].
 # 机器人初始放置的最大难度档，合法范围：[0, 9]
-# 提到 2：评测时 L4 楼梯/坡完全不会的根因之一是 1500 step 时大量 env 还卡在 L0~L1。
-# command 收紧后晋级会顺畅，但仍然要让一部分 env 起步在中等难度，确保 L3-L4 地形
-# 在训练里有足够样本。0 → 2 是较保守的提升，避免 L4 摔死打乱 curriculum。
-# Bumped from 0 to 2 so a fraction of envs see mid-tier terrain from the start
-# once command-side tracking has been fixed; reduces L4 OOD at eval time.
+# 回退到 2：level 3 导致训练崩溃（step 只有几步），太多 env 直接 spawn 在高难地形
+# 立刻摔死，策略完全学不到东西。保持 2，让 curriculum 自然晋级。
+# Reverted from 3 to 2: level 3 caused immediate training collapse (instant falls).
 max_init_terrain_level = 2
 
 
@@ -105,6 +103,9 @@ push_interval_s = 15
 
 # Max push velocity in XY plane (m/s), must be >= 0.
 # XY 平面最大推力速度 (m/s)，必须 >= 0
+# 回退到 0.5：0.8 与 terrain level 3 叠加导致训练崩溃。
+# 扰动增强需要在策略已经稳定后再逐步引入，不能和难度提升同时做。
+# Reverted from 0.8 to 0.5: combined with other aggressive changes caused collapse.
 max_push_vel_xy = 0.5
 
 
@@ -211,7 +212,11 @@ command_name = "base_velocity"
 # Down-weighted: this body-frame signal cannot distinguish "advance" from
 # "circle-running at spawn"; the new `progress` term carries the main load.
 [rewards.forward_velocity]
-weight = 1.0
+# 权重 1.2：在保持 progress 为主信号的前提下，略微抬高持续前进意愿，
+# 直接针对下坡/台阶前犹豫、挂机与超时问题。
+# Slightly raised from 1.0 to 1.2 to reduce hesitation before descents and stairs
+# without letting body-frame speed dominate eval-aligned progress again.
+weight = 1.2
 [rewards.forward_velocity.params]
 command_name = "base_velocity"
 max_speed = 1.0
@@ -223,12 +228,12 @@ unconditional = true
 # 评测 standard 模式按 `||pos_current - pos_spawn||` 计分，本项就是该指标的密集
 # 单步差分。直接对治"凹地形（pyramid_*_inv）spawn 周围转圈跑步不上坡"——原地
 # 画圈、来回往返都拿不到分，只有"持续远离 spawn"才被奖励。
-# 权重 15：仍直接镜像评测中的 spawn 距离目标，但不再让单步 progress
-# 盖过姿态、落地缓冲和能耗项；优先修正当前"猛冲拿时间、姿态/能耗崩"的问题。
-# Reduced from 50 to 15 so true progress stays primary without overwhelming
-# posture, descent control, and efficiency terms.
+# 权重 18：比上一轮略回升，继续强调"持续远离 spawn"，
+# 但仍显著低于最初的 50，避免重新变成猛冲换时间。
+# Raised slightly from 15 to 18 to keep pressure against timeout/idling while
+# staying well below the overly aggressive regime.
 [rewards.progress]
-weight = 15.0
+weight = 18.0
 
 # --- Negative: base stability ---
 # --- 负向：基座稳定 ---
@@ -239,16 +244,19 @@ weight = 15.0
 # posture, so uphill terrains do not over-penalize and stall learning.
 [rewards.lin_vel_z_up]
 # Vertical linear velocity penalty, gated by upright posture.
-# 回调到 -0.6：继续给楼梯抬腿留空间，但明显加强下台阶/下坡时的竖直速度约束，
-# 直接压制当前录像里"砸下去"的失败模式。
-# Raised from -0.3 to -0.6 to reduce hard landings on downhill stairs while still
-# leaving enough room for upward stepping motion.
-weight = -0.6
+# 再加强到 -0.75：当前 `stairs_inv` 仍会下落砸地/摔倒，说明 -0.6 还不足以约束
+# 下台阶时的竖直冲击；继续保留比 NP3O 更宽松的空间，避免重新压死上楼。
+# Raised from -0.6 to -0.75 to further damp hard vertical impacts on downhill
+# stairs while keeping enough allowance for stair ascent.
+weight = -0.75
 
 [rewards.ang_vel_xy_up]
 # Pitch/roll angular velocity penalty, gated by upright posture.
-# X/Y 方向角速度惩罚（直立门控版）
-weight = -0.05
+# 提到 -0.08：当前仍有下坡/下台阶时机身前后俯仰和侧滚摆动过大，
+# 这项直接约束下行过程中的 pitch/roll 动态，减少迈空后栽倒。
+# Increased from -0.05 to -0.08 to suppress pitch/roll oscillation during
+# descents, reducing falls after stepping off edges.
+weight = -0.08
 
 # --- Removed: upward (was free standing reward) ---
 # --- 已移除：upward 是"站着不动也拿满分"的元凶 ---
@@ -298,23 +306,44 @@ threshold = 1
 # --- Extra: anti-tipping (NP3O orientation_up 版本，斜坡门控) ---
 # --- 额外：防倾倒（NP3O orientation_up 版本，斜坡上自动放宽）---
 # NP3O 中 orientation_up 仅 -0.2；此前用 -1.0 是 5 倍过重，导致斜坡上 pose 持续下降
-# （agent 被迫学到"贴坡爬"等扭曲姿态去逃避 pitch 惩罚）。下调到 NP3O 同尺度。
-# NP3O uses orientation_up=-0.2; the previous -1.0 was 5x too strict and was the
-# root cause of the late-stage pose-score regression seen in training.
+# （agent 被迫学到"贴坡爬"等扭曲姿态去逃避 pitch 惩罚）。当前继续小幅加强到 -0.3，
+# 主要针对下坡/台阶后的姿态恢复不足与持续超时问题。
+# Increased from -0.2 to -0.3 to improve posture recovery on stairs and downhill
+# segments without reintroducing the old slope-climbing suppression.
 [rewards.orientation_up]
-weight = -0.2
+weight = -0.3
 
 # --- Gait: long stride to suppress mincing steps ---
 # --- 步态：奖励长步幅，抑制小碎步 ---
 # 权重从 0.5 降到 0.25：原值过强导致 agent 拼命踢腿换大跨步，能耗显著上升、
-# energy_score 持续下降。0.25 仍能保留正向激励，又不至于把 tracking 信号挤掉。
-# Reduced from 0.5 to 0.25: too strong a stride bonus drives the agent to pump
-# torque and tanks the energy_score; 0.25 still encourages stride length safely.
+# energy_score 持续下降。当前小幅回升到 0.32，主要针对复杂地形前犹豫、超时和
+# 不愿跨出第一步的问题，同时仍低于曾经损伤能耗的过激区间。
+# Raised from 0.25 to 0.32 to reduce hesitation before obstacles while staying
+# below the torque-hungry regime that hurt energy score before.
 [rewards.feet_air_time]
-weight = 0.25
+weight = 0.32
 [rewards.feet_air_time.params]
 command_name = "base_velocity"
 threshold = 0.5
+
+# --- Gait: anti-stumble on stair edges (NP3O stumble_up equivalent) ---
+# --- 步态：反绊脚（NP3O stumble_up 等价项）---
+# 楼梯和倒台阶录像里仍有明显绊台阶边后失稳/摔倒现象；启用该项直接惩罚
+# 足端水平撞击远大于竖直支撑的异常接触，优先处理 stair edge trip。
+# Enabled to directly punish stair-edge trips that are still causing instability.
+[rewards.feet_stumble]
+weight = -0.05
+
+# --- Gait: anti-slide during stance (NP3O foot_slide_up equivalent) ---
+# --- 步态：支撑期防滑（NP3O foot_slide_up 等价项）---
+# 楼梯落脚后轻微滑移会放大 pitch/roll 摆动并触发连锁摔倒；先用较小权重接入，
+# 约束支撑相的水平滑动而不过度抑制正常跨步。
+# Enabled with a small weight to reduce support-foot slip on stairs.
+[rewards.feet_slide]
+weight = -0.03
+[rewards.feet_slide.params]
+command_name = "base_velocity"
+contact_force_threshold = 1.0
 
 # --- Gait: keep hips close to default ---
 # --- 步态：髋关节回中（抑制外八/碎步）---
@@ -330,20 +359,19 @@ weight = -0.05
 
 # --- Gait: diagonal-leg mirror symmetry (NP3O foot_mirror_up) ---
 # --- 步态：对角腿镜像（直接对治"右后腿悬空 / 步态不对称"）---
-# NP3O 中 `foot_mirror_up = -0.05`：FL≈RR、FR≈RL 的关节对称约束，trot 步态下
-# 是对角腿同相位的物理体现。这是当前评测中"右后腿长期悬空、其它腿小碎步"
-# 缺失的关键 shaping 信号。直立门控保留，倒地后不继续累罚。
-# Critical missing piece for the asymmetric-gait failure mode observed in eval.
+# 加强到 -0.08：当前仍有单腿悬空卡住的现象，说明对角腿协调约束不够。
+# Increased from -0.05 to -0.08 to further enforce diagonal-leg coordination
+# and reduce single-leg-stuck failures on stairs.
 [rewards.foot_mirror_up]
-weight = -0.05
+weight = -0.08
 
 # --- Gait: anti-air (require >=2 feet contact when moving) ---
 # --- 步态：反离地（移动中至少 2 足触地）---
 # 直接 cap 掉"3 腿离地、1 腿支撑"或"右后腿干脆不参与"的极端步态。
-# 移动门控避免与跳跃/起步阶段冲突。
-# Anti-air constraint to clamp the "floating leg" failure observed in eval.
+# 加强到 -1.0：录像中仍有一条腿悬空卡住的现象，-0.5 不够。
+# Doubled from -0.5 to -1.0: video still shows single-leg-stuck-in-air failures.
 [rewards.no_fly]
-weight = -0.5
+weight = -1.0
 [rewards.no_fly.params]
 command_threshold = 0.1
 
@@ -374,15 +402,14 @@ command_threshold = 0.1
 # Critical for stairs: enforces a body-frame z target for the swing foot so the
 # agent learns to actually lift its legs over step edges.
 [rewards.feet_height_body]
-# 权重恢复到 -0.05（NP3O 量级）：此前 -0.02 是为了避免早期"不抬腿不走"，但现在
-# forward_velocity 已无条件且权重 2.0，前进信号足够强；楼梯 L4 上不去的根因之一
-# 就是抬腿不够，必须把 swing-foot 高度信号恢复到位。
-# Restored to -0.05 (NP3O scale): forward_velocity now dominates, so this can
-# safely return to its full strength to actually fix the stairs failure mode.
-weight = -0.05
+# 适度加强到 -0.08：与新增的 stumble/slide 一起提高 swing-foot 清障能力，
+# 减少上台阶卡边和下台阶摆腿不干净的问题；仍显著低于 NP3O 的激进量级。
+# Increased from -0.05 to -0.08 to improve stair clearance while remaining well
+# below the much stronger NP3O shaping level.
+weight = -0.08
 [rewards.feet_height_body.params]
 command_name = "base_velocity"
-target_height = -0.30
+target_height = -0.26
 tanh_mult = 2.0
 
 # --- Posture: keep base height (avoid duck-walking) ---
@@ -391,11 +418,11 @@ tanh_mult = 2.0
 # Mirrors NP3O `base_height_up`; prevents the duck-walking failure mode where the
 # robot collapses its hips to bypass `feet_height_body`.
 [rewards.correct_base_height]
-# 权重从 -0.5 降到 -0.2：上坡 / 楼梯地形上 root_z 天然偏离 target，过强惩罚会
-# 鼓励"原地保持高度不前进"。NP3O 在 base_height_up=-10 同时配合很多约束才稳定，
-# 我们尚未补齐，先弱化避免压制前进。
-# Reduced from -0.5 to -0.2 to avoid penalizing natural height changes on slopes.
-weight = -0.2
+# 适度加强到 -0.35：楼梯不稳常伴随机身塌陷和重心恢复慢，这项与 clearance/stumble
+# 一起约束"塌腰硬蹭过台阶"的退化解；仍远弱于 NP3O 原始强度。
+# Increased from -0.2 to -0.35 to improve body-height stability on stairs while
+# staying much weaker than the original NP3O scale.
+weight = -0.35
 [rewards.correct_base_height.params]
 target_height = 0.32
 
@@ -416,10 +443,9 @@ weight = -1.5e-4
 
 # --- Termination: explicit fall penalty ---
 # --- 终止惩罚：明确"摔了就疼"---
-# 当前配置摔倒只是早结束，没有显式负奖励，agent 学不到"避免摔倒"的偏好；
-# 加一个 termination 罚分让早期学习有方向。
-# Without a termination penalty, the agent has no explicit signal to avoid
-# falls, which compounds the "stand still on hard terrain" failure mode.
+# 回退到 -1.0：-2.0 与高难地形/强推力叠加后，频繁摔倒 × 高惩罚 = 策略崩溃。
+# 保持 -1.0 作为基础信号，避免死循环。
+# Reverted from -2.0 to -1.0: too costly when combined with frequent early falls.
 [rewards.termination]
 weight = -1.0
 
