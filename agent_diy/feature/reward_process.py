@@ -346,12 +346,30 @@ class RewardProcess(RewardProcessBase):
         return 1.0 - asset.data.projected_gravity_b[:, 2]
 
     def _upright_gate(self):
-        """Gating coefficient: 1 when robot is upright, 0 when severely tilted.
+        """Asymmetric posture gate: floor=0.7 when descending, floor=0 when climbing.
 
-        上身姿态门控系数：直立时为 1，严重倾倒时为 0，用于 NP3O `*_up` 系列。
+        非对称门控：
+        - 上坡（机头朝上，``projected_gravity_b[:, 0] > 0``）→ floor=0，回归 NP3O 原版
+          完全释放姿态惩罚的行为，避免上坡时被姿态约束打击导致 agent 干脆不上坡。
+        - 下坡（机头朝下，``projected_gravity_b[:, 0] < 0``）→ floor=0.7，下楼/下坡
+          保留更强的姿态约束，针对当前评测中 `pyramid_stairs_inv` 的摔落问题。
+
+        关键修复：上一版统一 floor=0.5 是导致这次评测中 `倒台阶/倒斜坡`（上坡地形）
+        agent 在 spawn 周围转圈、不上坡的诱因之一——上坡时本就该释放的姿态惩罚被
+        硬性保留了下来；而对下楼来说 0.5 又不够抑制"砸下去"。
+
+        IsaacLab 中 ``projected_gravity_b`` = 世界重力 (0,0,-g) 旋到机体系。
+        机头上仰 → ``g_x > 0``；机头下俯 → ``g_x < 0``。
+        Asymmetric: fully release on climbs, but enforce a stronger floor on
+        descents to improve downhill stair stability.
         """
         asset = self._get_robot_asset()
-        return torch.clamp(-asset.data.projected_gravity_b[:, 2], 0.0, 1.0)
+        g_z = asset.data.projected_gravity_b[:, 2]
+        g_x = asset.data.projected_gravity_b[:, 0]
+        base = torch.clamp(-g_z, 0.0, 1.0)
+        descending = (g_x < 0.0).float()
+        floor = descending * 0.7
+        return torch.maximum(base, floor)
 
     def _reward_lin_vel_z_up(self):
         """Penalize vertical linear velocity, gated by upright posture.
@@ -434,7 +452,13 @@ class RewardProcess(RewardProcessBase):
         forces = contact_sensor.data.net_forces_w_history[:, :, sensor_cfg.body_ids, :]
         contact = (forces.norm(dim=-1).max(dim=1)[0] > 1.0).float()
         cmd = self.env.command_manager.get_command("base_velocity")
-        idle = (torch.norm(cmd[:, :2], dim=1) < command_threshold).float()
+        # idle 判定同时考察 ang_vel：原版只看线速度，"lin≈0 + |ang_z|=1" 时被错误
+        # 视为 idle 并给四脚触地满分，让 agent 学到"原地转 + 站着拿满分"的退化解。
+        # idle gate now also requires near-zero yaw-rate command, otherwise spinning
+        # in place gets falsely rewarded as standing.
+        lin_idle = torch.norm(cmd[:, :2], dim=1) < command_threshold
+        ang_idle = torch.abs(cmd[:, 2]) < command_threshold * 2.0
+        idle = (lin_idle & ang_idle).float()
         n_feet = max(1, contact.shape[1])
         return idle * contact.sum(dim=1) / n_feet
 
@@ -447,7 +471,11 @@ class RewardProcess(RewardProcessBase):
         """
         asset = self._get_robot_asset()
         cmd = self.env.command_manager.get_command("base_velocity")
-        idle = (torch.norm(cmd[:, :2], dim=1) < command_threshold).float()
+        # 同 has_contact：idle 必须同时 lin≈0 且 |ang_z|≈0，避免转向时被错判 idle。
+        # Same fix as `has_contact`: require both linear and angular cmd near zero.
+        lin_idle = torch.norm(cmd[:, :2], dim=1) < command_threshold
+        ang_idle = torch.abs(cmd[:, 2]) < command_threshold * 2.0
+        idle = (lin_idle & ang_idle).float()
         upright = 1.0 - asset.data.projected_gravity_b[:, 2]
         delta = torch.sum(torch.abs(asset.data.joint_pos - asset.data.default_joint_pos), dim=1)
         return delta * upright * idle
@@ -588,19 +616,66 @@ class RewardProcess(RewardProcessBase):
         command_name: str = "base_velocity",
         max_speed: float = 1.0,
         cmd_threshold: float = 0.05,
+        unconditional: bool = True,
     ):
-        """Dense reward for actual forward speed in body frame, gated by positive x-cmd.
+        """Dense reward for actual forward speed in body frame.
 
-        前向速度密集奖励：当存在 ``cmd_x > cmd_threshold`` 的前进指令时，按
-        ``clamp(base_lin_vel_x, 0, max_speed)`` 给正奖励；与高斯型 ``track_lin_vel_xy``
-        互补——后者奖励"匹配指令"（cmd=0 时也给满分），本项确保"必须真的向前走"
-        才有奖励，直接修复"站着不动也能拿高分"的局部最优。
+        前向速度密集奖励：默认 ``unconditional=True``——**与 command 解耦**，无论评测端
+        采到什么 command（cmd_x=0 / 负值 / 纯转向），策略都被持续激励向身体前向行进。
+        这是适配"评测 command 不可控"的核心 shaping 信号：评分目标是前进距离，而本
+        项是唯一保证"前进"成为内生偏好的密集奖励；`track_lin_vel_xy` 在 cmd=0 时给
+        满分会把策略带回"站着"，必须用本项压住它。
+        当 ``unconditional=False`` 时回退到旧行为（仅在 cmd_x > 阈值时发奖励）。
         """
         asset = self._get_robot_asset()
+        fwd_vel = asset.data.root_lin_vel_b[:, 0]
+        reward = torch.clamp(fwd_vel, min=0.0, max=max_speed)
+        if unconditional:
+            return reward
         cmd = self.env.command_manager.get_command(command_name)
         has_fwd_cmd = (cmd[:, 0] > cmd_threshold).float()
-        fwd_vel = asset.data.root_lin_vel_b[:, 0]
-        return torch.clamp(fwd_vel, min=0.0, max=max_speed) * has_fwd_cmd
+        return reward * has_fwd_cmd
+
+    def _reward_progress(self):
+        """Reward gain in 2D distance from the spawn point (env origin) per step.
+
+        距离 spawn 增量奖励：直接对治"在出生点附近转圈跑步"——本项只在机器人
+        真正**远离 spawn** 时才给正奖励，原地画圈跑、来回往返都拿不到分。
+        与 ``forward_velocity`` 的差异：后者是机体系前向速度，原地转圈跑也可以
+        持续为正；本项基于世界系下"距离 spawn 的位移"，对应 standard 模式评分
+        的 ``\|pos_current - pos_spawn\|`` 公式，是与评测目标最对齐的密集信号。
+
+        实现：用上一步距离与当前距离的差。回合重置时清零，避免起步跳变。
+        Mirrors the standard-mode scoring metric (||pos_current - pos_spawn||);
+        directly penalizes "circling at spawn" because circular motion does not
+        accumulate distance from the origin.
+        """
+        asset = self._get_robot_asset()
+        pos = asset.data.root_pos_w[:, :2]
+        if hasattr(self.env.scene, "env_origins") and self.env.scene.env_origins is not None:
+            origin = self.env.scene.env_origins[:, :2]
+        else:
+            origin = torch.zeros_like(pos)
+        current_dist = torch.norm(pos - origin, dim=1)
+
+        prev = getattr(self, "_diy_progress_prev", None)
+        if prev is None or prev.shape != current_dist.shape or prev.device != current_dist.device:
+            self._diy_progress_prev = current_dist.clone()
+            return torch.zeros_like(current_dist)
+
+        delta = current_dist - self._diy_progress_prev
+
+        # Reset on episode boundary so spawn-pos jump does not produce spurious reward.
+        # 回合重置时清零，避免 spawn 切换造成距离跳变被误当作 progress。
+        term_mgr = self.env.termination_manager
+        reset_mask = term_mgr.terminated | term_mgr.time_outs
+        delta = torch.where(reset_mask, torch.zeros_like(delta), delta)
+
+        self._diy_progress_prev = current_dist.clone()
+
+        # 仅奖励"远离 spawn"的位移；返回 m/step（典型 dt≈0.02s 时约 0.01 m/step）。
+        # Reward only positive progress so back-and-forth motion does not accumulate.
+        return torch.clamp(delta, min=0.0)
 
     # --- Termination penalty / 终止惩罚 ---
     def _reward_termination(self):

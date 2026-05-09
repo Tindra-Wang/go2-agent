@@ -52,12 +52,12 @@ curriculum = true
 
 # Max init difficulty tier for robot placement, valid range: [0, 9].
 # 机器人初始放置的最大难度档，合法范围：[0, 9]
-# 课程从 0 档起步：网络早期根本没学会走路，把它直接丢到难度 5（含 stairs / maze）
-# 会让前几百次 episode 全部摔死，外现就是 "开局挂机"。NP3O 默认从 0 起步，curriculum
-# 会按完成度自动晋级，难度学习曲线更平滑。
-# Start the curriculum at tier 0; jumping straight to tier 5 with stairs/maze
-# stalls early training (the well-known "stand still" warmup symptom).
-max_init_terrain_level = 0
+# 提到 2：评测时 L4 楼梯/坡完全不会的根因之一是 1500 step 时大量 env 还卡在 L0~L1。
+# command 收紧后晋级会顺畅，但仍然要让一部分 env 起步在中等难度，确保 L3-L4 地形
+# 在训练里有足够样本。0 → 2 是较保守的提升，避免 L4 摔死打乱 curriculum。
+# Bumped from 0 to 2 so a fraction of envs see mid-tier terrain from the start
+# once command-side tracking has been fixed; reduces L4 OOD at eval time.
+max_init_terrain_level = 2
 
 
 # Sub-terrain proportions (all proportions must sum to 1.0).
@@ -126,32 +126,40 @@ pos = [0.0, 0.0, 0.35]
 
 # === Velocity Commands ===
 # === 速度命令 ===
+# 关键背景：评测端 command 配置由比赛方提供且不可修改，所以**训练端**必须做到：
+# (1) 训练分布只覆盖"前进"这一种 cmd，让策略学到"始终往前走"的稳定行为；
+# (2) 即使评测时被采到 cmd_x=0 / cmd 反向 / 大幅旋转，策略也以前进作为默认动作。
+# 配合 `forward_velocity` 的 unconditional 改造，前进是策略的内生偏好而非 cmd 触发。
+# Eval-time command sampling is fixed by the competition organizer; we adapt by
+# narrowing the *training* distribution to forward-only commands so the policy's
+# default behavior is "always go forward" regardless of eval-time cmd.
 [commands]
-# Velocity command resampling interval [min, max] (seconds).
-# 速度命令重采样区间 [min, max]（秒）
-resampling_time = [10.0, 10.0]
+# resampling_time 拉长到 = episode_length_s，避免 episode 中途换 cmd 引起"走一半挂机"。
+# Match resampling to the full episode so cmd never changes mid-episode.
+resampling_time = [25.0, 25.0]
 
 [commands.limit]
 # Velocity command **hard limits** (curriculum may expand sampling range up to here).
 # 速度命令 **采样上限**（硬约束，curriculum 最多扩展到该范围）
-# 参考 NP3O Go2ConstraintHimRoughCfg.commands.ranges：上限收敛到 ~1m/s，
-# 避免 curriculum 把目标速度推到 2m/s 让机器人完全跟不上、tracking 长期 ≈ 0。
-# Reference NP3O: clamp the hard upper bound around 1 m/s so the curriculum
-# does not drift to unreachable targets that drown the tracking signal.
-lin_vel_x = [-1.0, 1.0]
-lin_vel_y = [-0.6, 0.6]
-ang_vel_z = [-1.0, 1.0]
+# 收紧到 forward-only：lin_vel_x ≥ 0.3 杜绝后退命令；ang_vel_z 上限 0.5 避免训练里
+# 出现"原地高速旋转"样本——它会让策略把"转身"当成 cmd-tracking 的合法解，
+# 评测时碰到大 yaw cmd 就直接转圈超时。
+# Forward-only hard limit: no backward cmd (root cause of "fall on downhill stairs"
+# when cmd_x is sampled negative); yaw cap at 0.5 avoids "spin in place" attractor.
+lin_vel_x = [0.3, 1.0]
+lin_vel_y = [-0.3, 0.3]
+ang_vel_z = [-0.5, 0.5]
 
 [commands.ranges]
 # Velocity command **initial sampling ranges** (expand towards limit when curriculum is enabled).
 # 速度命令 **初始采样范围**（curriculum 开启时会动态扩大到 limit）
 
-# Start with forward-only to prevent reversing that triggers stair-curriculum demotions;
-# curriculum will expand towards limit.
-# 初始只前进，避免后退导致楼梯频繁降级；curriculum 会扩展到 limit
-lin_vel_x = [0.0, 0.5]
-lin_vel_y = [-0.3, 0.3]
-ang_vel_yaw = [-1.0, 1.0]
+# 全程 forward-only：lin_vel_x 起步就在 [0.3, 0.6]，curriculum 会扩到 limit [0.3, 1.0]。
+# yaw 范围适度（±0.5）允许地形（坡顶 / 楼梯过渡）下的小幅修正，但不至于让策略学到"长时间转圈"。
+# Forward-only throughout the curriculum; yaw range left modest for slope/stair micro-corrections.
+lin_vel_x = [0.3, 0.6]
+lin_vel_y = [-0.2, 0.2]
+ang_vel_yaw = [-0.5, 0.5]
 
 
 # =====================================================================
@@ -170,7 +178,11 @@ ang_vel_yaw = [-1.0, 1.0]
 # Match NP3O tracking weights and broaden sigma so partial tracking still yields
 # meaningful gradient instead of collapsing to "stand still when cmd≈0".
 [rewards.track_lin_vel_xy]
-weight = 2.0
+# 权重从 2.0 降到 0.8：评测端 cmd 不可控，tracking 仍需退居辅助，
+# 但 0.5 对姿态/节奏约束偏弱，容易放大只求冲距离的退化策略。
+# Raised slightly from 0.5 to 0.8 to recover motion discipline without bringing
+# back the cmd=0 standing attractor.
+weight = 0.8
 [rewards.track_lin_vel_xy.params]
 # Std of Gaussian kernel, controls how sharp the error → reward decay is.
 # 高斯核标准差，控制误差 → 奖励的衰减陡峭程度
@@ -180,25 +192,43 @@ std = 0.5
 command_name = "base_velocity"
 
 [rewards.track_ang_vel_z]
-weight = 1.0
+# 权重从 1.0 降到 0.4：仍避免把策略拉向原地转圈 tracking，
+# 但比 0.25 更能约束下台阶和转向时的朝向稳定。
+# Raised from 0.25 to 0.4 to recover heading stability, especially on downhill
+# stairs, without reintroducing a spin-in-place attractor.
+weight = 0.4
 [rewards.track_ang_vel_z.params]
 std = 0.25
 command_name = "base_velocity"
 
-# --- Positive: dense forward-velocity bonus ---
-# --- 正向：前向速度密集奖励 ---
-# 关键修复：上一轮训练 8.4/100 的前进分数 + 0 时间分 + 93.76 能耗分 = "站着不动"
-# 的局部最优。`track_lin_vel_xy` 在 cmd=0 时给满分（站着达成），无法逼出真前进；
-# 本项强制：只有当 cmd_x > 0.05 且实际 vx > 0 时才给奖励，weight=1.0 与 tracking
-# 同量级，确保"真的往前走"才是局部最优。
-# Critical fix for "stand still" failure mode observed in eval: this dense bonus
-# only fires when there IS a forward command AND the robot actually advances.
+# --- Positive: dense forward-velocity bonus (gait shaping only) ---
+# --- 正向：前向速度密集奖励（步态 shaping，不再是主前进信号）---
+# 权重从 2.0 降回 1.0：本项基于 `root_lin_vel_b[:, 0]`（机体系前向速度），无法
+# 区分"真前进"和"原地转圈跑步"——上一版评测中 `倒斜坡/倒台阶`（凹地形，spawn
+# 在最低点）的 agent 学到"在 spawn 的平地圈圈跑刷 forward_velocity，永远不上坡"
+# 就是这一项过强 + 不会区分世界位移导致的。本项现在仅作"步态前向"的辅助 shaping，
+# 真正的前进奖励让位给 `progress`（基于世界系到 spawn 的位移，转圈时为 0）。
+# Down-weighted: this body-frame signal cannot distinguish "advance" from
+# "circle-running at spawn"; the new `progress` term carries the main load.
 [rewards.forward_velocity]
 weight = 1.0
 [rewards.forward_velocity.params]
 command_name = "base_velocity"
 max_speed = 1.0
 cmd_threshold = 0.05
+unconditional = true
+
+# --- Positive: world-frame progress away from spawn (eval-aligned) ---
+# --- 正向：远离出生点的世界系距离增量（与评测目标对齐的核心信号）---
+# 评测 standard 模式按 `||pos_current - pos_spawn||` 计分，本项就是该指标的密集
+# 单步差分。直接对治"凹地形（pyramid_*_inv）spawn 周围转圈跑步不上坡"——原地
+# 画圈、来回往返都拿不到分，只有"持续远离 spawn"才被奖励。
+# 权重 15：仍直接镜像评测中的 spawn 距离目标，但不再让单步 progress
+# 盖过姿态、落地缓冲和能耗项；优先修正当前"猛冲拿时间、姿态/能耗崩"的问题。
+# Reduced from 50 to 15 so true progress stays primary without overwhelming
+# posture, descent control, and efficiency terms.
+[rewards.progress]
+weight = 15.0
 
 # --- Negative: base stability ---
 # --- 负向：基座稳定 ---
@@ -209,10 +239,11 @@ cmd_threshold = 0.05
 # posture, so uphill terrains do not over-penalize and stall learning.
 [rewards.lin_vel_z_up]
 # Vertical linear velocity penalty, gated by upright posture.
-# 权重从 -2.0 降到 -1.0：上坡时 z 方向天然有速度，过强的 z 惩罚会鼓励"贴坡蹭走"
-# 而不是抬腿；与 `forward_velocity` 一起把"必须前进"塑造成主信号。
-# Reduced from -2.0 to -1.0: too strong a z-vel penalty discourages climbing.
-weight = -1.0
+# 回调到 -0.6：继续给楼梯抬腿留空间，但明显加强下台阶/下坡时的竖直速度约束，
+# 直接压制当前录像里"砸下去"的失败模式。
+# Raised from -0.3 to -0.6 to reduce hard landings on downhill stairs while still
+# leaving enough room for upward stepping motion.
+weight = -0.6
 
 [rewards.ang_vel_xy_up]
 # Pitch/roll angular velocity penalty, gated by upright posture.
@@ -316,24 +347,24 @@ weight = -0.5
 [rewards.no_fly.params]
 command_threshold = 0.1
 
-# --- Idle: all four feet on the ground when commanded to stand (NP3O has_contact) ---
-# --- 静止：cmd≈0 时奖励四脚均触地（NP3O has_contact）---
-# 在低速指令下若一条腿未落地就拿不到满分，与 stand_nice 一起把 agent 拉回
-# 标准四脚站姿，直接处理"挂机时一条腿悬空"。
-[rewards.has_contact]
-weight = 0.5
-[rewards.has_contact.params]
-command_threshold = 0.1
+# --- Idle rewards 已禁用 ---
+# --- DISABLED: idle rewards 在评测 cmd 不可控的情境下是"鼓励挂机"的元凶 ---
+# 原 has_contact (+0.5) + stand_nice (-0.1) 在 cmd≈0 时会发出"站着满分"的信号，
+# 评测端一旦把 cmd 采到接近零，这两项立刻把策略拉回站立。哪怕 reward_process 里
+# 已经把 idle 判定加上 ang_vel 门控，但只要 lin_vel_x cmd=0 + yaw cmd=0 这种组合
+# 出现，策略仍会被诱导挂机。此次直接关闭，强制只剩"前进/姿态"两类信号。
+# Disabled because they form a "stand still" attractor whenever the eval cmd
+# happens to land near zero — exactly the failure observed in evaluation.
+# 如确认评测端 cmd 始终非零，可重新启用并适度调小权重。
+# [rewards.has_contact]
+# weight = 0.5
+# [rewards.has_contact.params]
+# command_threshold = 0.1
 
-# --- Idle: pull joints back to default when standing & upright (NP3O stand_nice) ---
-# --- 静止：cmd≈0 + 直立时强制回 default 姿态（NP3O stand_nice）---
-# 直接对治"开局/中途挂机在扭曲姿态"：只要还在挂机就一直被罚 |q - q_default|，
-# 必须复位到标准站姿才能停止累计。倒地时门控关闭，避免摔倒后继续累罚。
-# Critical for the "freeze in odd pose" failure mode at start / mid-episode.
-[rewards.stand_nice]
-weight = -0.1
-[rewards.stand_nice.params]
-command_threshold = 0.1
+# [rewards.stand_nice]
+# weight = -0.1
+# [rewards.stand_nice.params]
+# command_threshold = 0.1
 
 # --- Gait: foot-clearance during swing (key for stairs) ---
 # --- 步态：摆动腿抬脚高度（楼梯关键奖励）---
@@ -343,10 +374,12 @@ command_threshold = 0.1
 # Critical for stairs: enforces a body-frame z target for the swing foot so the
 # agent learns to actually lift its legs over step edges.
 [rewards.feet_height_body]
-# 权重从 -0.05 降到 -0.02：早期随机策略下抬腿目标本就难达成，过强惩罚会让
-# agent 选择"不抬腿不走"。等 forward_velocity 把前进塑稳后再调回 -0.05。
-# Reduced from -0.05 to -0.02 to avoid stalling exploration early in training.
-weight = -0.02
+# 权重恢复到 -0.05（NP3O 量级）：此前 -0.02 是为了避免早期"不抬腿不走"，但现在
+# forward_velocity 已无条件且权重 2.0，前进信号足够强；楼梯 L4 上不去的根因之一
+# 就是抬腿不够，必须把 swing-foot 高度信号恢复到位。
+# Restored to -0.05 (NP3O scale): forward_velocity now dominates, so this can
+# safely return to its full strength to actually fix the stairs failure mode.
+weight = -0.05
 [rewards.feet_height_body.params]
 command_name = "base_velocity"
 target_height = -0.30
