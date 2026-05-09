@@ -486,6 +486,25 @@ class RewardProcess(RewardProcessBase):
     # `[rewards.flat_orientation]` 共同覆盖；本文件不再额外定义 `_reward_collision_up`，
     # 避免依赖私有 helper，保持 reward_process 仅扩展 NP3O 中本仓库未提供的项。
 
+    def _reward_forward_velocity(
+        self,
+        command_name: str = "base_velocity",
+        max_speed: float = 1.0,
+        cmd_threshold: float = 0.05,
+    ):
+        """Dense reward for actual forward speed in body frame, gated by positive x-cmd.
+
+        前向速度密集奖励：当存在 ``cmd_x > cmd_threshold`` 的前进指令时，按
+        ``clamp(base_lin_vel_x, 0, max_speed)`` 给正奖励；与高斯型 ``track_lin_vel_xy``
+        互补——后者奖励"匹配指令"（cmd=0 时也给满分），本项确保"必须真的向前走"
+        才有奖励，直接修复"站着不动也能拿高分"的局部最优。
+        """
+        asset = self._get_robot_asset()
+        cmd = self.env.command_manager.get_command(command_name)
+        has_fwd_cmd = (cmd[:, 0] > cmd_threshold).float()
+        fwd_vel = asset.data.root_lin_vel_b[:, 0]
+        return torch.clamp(fwd_vel, min=0.0, max=max_speed) * has_fwd_cmd
+
     # --- Termination penalty / 终止惩罚 ---
     def _reward_termination(self):
         """Penalize real failures (terminated AND NOT timed-out AND NOT goal-reached).

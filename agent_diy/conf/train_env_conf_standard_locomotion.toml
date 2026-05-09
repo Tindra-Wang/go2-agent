@@ -164,25 +164,41 @@ ang_vel_yaw = [-1.0, 1.0]
 
 # --- Positive: velocity tracking ---
 # --- 正向：速度跟踪 ---
-# NP3O Go2ConstraintHimRoughCfg 中 tracking_lin_vel = 2.0、tracking_ang_vel = 1.0；
-# 当前训练 forward 分提升缓慢，是因为主信号被其他 penalty 淹没，提权到接近 NP3O 比例。
-# Bring tracking weights closer to NP3O ratios so the velocity-tracking signal
-# dominates instead of being drowned by penalty terms.
+# NP3O Go2ConstraintHimRoughCfg 中 tracking_lin_vel = 2.0、tracking_ang_vel = 1.0；提权到 NP3O 比例。
+# 同时把 std 从 0.25 放宽到 0.5：原值在 cmd=0.25/vx=0 时仅给 ~0.55 满分，梯度过陡，
+# agent 在 cmd=0（resampling 起点 [0.0, 0.5] 会采到 0）时反而能"站着拿满分"。
+# Match NP3O tracking weights and broaden sigma so partial tracking still yields
+# meaningful gradient instead of collapsing to "stand still when cmd≈0".
 [rewards.track_lin_vel_xy]
-weight = 1.5
+weight = 2.0
 [rewards.track_lin_vel_xy.params]
 # Std of Gaussian kernel, controls how sharp the error → reward decay is.
 # 高斯核标准差，控制误差 → 奖励的衰减陡峭程度
-std = 0.25
+std = 0.5
 # Velocity command name.
 # 速度命令名
 command_name = "base_velocity"
 
 [rewards.track_ang_vel_z]
-weight = 0.75
+weight = 1.0
 [rewards.track_ang_vel_z.params]
 std = 0.25
 command_name = "base_velocity"
+
+# --- Positive: dense forward-velocity bonus ---
+# --- 正向：前向速度密集奖励 ---
+# 关键修复：上一轮训练 8.4/100 的前进分数 + 0 时间分 + 93.76 能耗分 = "站着不动"
+# 的局部最优。`track_lin_vel_xy` 在 cmd=0 时给满分（站着达成），无法逼出真前进；
+# 本项强制：只有当 cmd_x > 0.05 且实际 vx > 0 时才给奖励，weight=1.0 与 tracking
+# 同量级，确保"真的往前走"才是局部最优。
+# Critical fix for "stand still" failure mode observed in eval: this dense bonus
+# only fires when there IS a forward command AND the robot actually advances.
+[rewards.forward_velocity]
+weight = 1.0
+[rewards.forward_velocity.params]
+command_name = "base_velocity"
+max_speed = 1.0
+cmd_threshold = 0.05
 
 # --- Negative: base stability ---
 # --- 负向：基座稳定 ---
@@ -193,21 +209,27 @@ command_name = "base_velocity"
 # posture, so uphill terrains do not over-penalize and stall learning.
 [rewards.lin_vel_z_up]
 # Vertical linear velocity penalty, gated by upright posture.
-# Z 方向线速度惩罚（直立门控版）
-weight = -2.0
+# 权重从 -2.0 降到 -1.0：上坡时 z 方向天然有速度，过强的 z 惩罚会鼓励"贴坡蹭走"
+# 而不是抬腿；与 `forward_velocity` 一起把"必须前进"塑造成主信号。
+# Reduced from -2.0 to -1.0: too strong a z-vel penalty discourages climbing.
+weight = -1.0
 
 [rewards.ang_vel_xy_up]
 # Pitch/roll angular velocity penalty, gated by upright posture.
 # X/Y 方向角速度惩罚（直立门控版）
 weight = -0.05
 
-# --- Positive: incentivize uphill / 上坡正向激励 ---
-# 直接修复“pyramid_slope_inv / pyramid_stairs_inv 学不上去”的问题：
-# `1 - projected_gravity_z` 在机身仰起时 > 0，给上坡 / 上楼梯一个明确的正激励。
-# Directly addresses poor performance on inv terrains: rewards the agent for
-# tilting upright into a slope/stair rather than refusing to climb.
-[rewards.upward]
-weight = 0.5
+# --- Removed: upward (was free standing reward) ---
+# --- 已移除：upward 是"站着不动也拿满分"的元凶 ---
+# `1 - projected_gravity_z` 在直立时恒等于 ~2，权重 0.5 → +1.0/step 恒定免费奖励。
+# 上轮评估 `前进 8.4 / 时间 0 / 能耗 93.76` 的根因正是它：standing 拿到的正向
+# reward (≈ tracking@cmd=0 + upward) 比实际走（tracking + 各种惩罚）还高。
+# 完整对齐 NP3O 需要配合 `has_contact` / `stand_nice` / `base_height_up=-10` 等多项
+# 才能让 upward 不被当作免费午餐；本仓库尚未补齐，因此先关闭。
+# 如要重新启用，需要先验证 `forward_velocity` 已稳定为主信号，再按 NP3O 比例引入。
+# DISABLED: upward acts as a free reward for standing in our current setup.
+# [rewards.upward]
+# weight = 0.5
 
 # --- Negative: joint smoothness ---
 # --- 负向：关节 ---
@@ -278,7 +300,10 @@ weight = -0.02
 # Critical for stairs: enforces a body-frame z target for the swing foot so the
 # agent learns to actually lift its legs over step edges.
 [rewards.feet_height_body]
-weight = -0.05
+# 权重从 -0.05 降到 -0.02：早期随机策略下抬腿目标本就难达成，过强惩罚会让
+# agent 选择"不抬腿不走"。等 forward_velocity 把前进塑稳后再调回 -0.05。
+# Reduced from -0.05 to -0.02 to avoid stalling exploration early in training.
+weight = -0.02
 [rewards.feet_height_body.params]
 command_name = "base_velocity"
 target_height = -0.30
@@ -290,7 +315,11 @@ tanh_mult = 2.0
 # Mirrors NP3O `base_height_up`; prevents the duck-walking failure mode where the
 # robot collapses its hips to bypass `feet_height_body`.
 [rewards.correct_base_height]
-weight = -0.5
+# 权重从 -0.5 降到 -0.2：上坡 / 楼梯地形上 root_z 天然偏离 target，过强惩罚会
+# 鼓励"原地保持高度不前进"。NP3O 在 base_height_up=-10 同时配合很多约束才稳定，
+# 我们尚未补齐，先弱化避免压制前进。
+# Reduced from -0.5 to -0.2 to avoid penalizing natural height changes on slopes.
+weight = -0.2
 [rewards.correct_base_height.params]
 target_height = 0.32
 

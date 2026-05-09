@@ -296,6 +296,16 @@ def build_monitor():
             expr="avg(reward_track_ang_vel_z{})",
         )
         .end_panel()
+        .add_panel(
+            name="前向速度密集奖励",
+            name_en="reward_forward_velocity",
+            type="line",
+        )
+        .add_metric(
+            metrics_name="reward_forward_velocity",
+            expr="avg(reward_forward_velocity{})",
+        )
+        .end_panel()
         .end_group()
         .add_group(
             group_name="奖励姿态与上坡",
