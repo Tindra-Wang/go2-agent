@@ -204,19 +204,14 @@ command_name = "base_velocity"
 
 # --- Positive: dense forward-velocity bonus (gait shaping only) ---
 # --- 正向：前向速度密集奖励（步态 shaping，不再是主前进信号）---
-# 权重从 2.0 降回 1.0：本项基于 `root_lin_vel_b[:, 0]`（机体系前向速度），无法
-# 区分"真前进"和"原地转圈跑步"——上一版评测中 `倒斜坡/倒台阶`（凹地形，spawn
-# 在最低点）的 agent 学到"在 spawn 的平地圈圈跑刷 forward_velocity，永远不上坡"
-# 就是这一项过强 + 不会区分世界位移导致的。本项现在仅作"步态前向"的辅助 shaping，
-# 真正的前进奖励让位给 `progress`（基于世界系到 spawn 的位移，转圈时为 0）。
-# Down-weighted: this body-frame signal cannot distinguish "advance" from
-# "circle-running at spawn"; the new `progress` term carries the main load.
+# 大幅削弱到 0.3：这项是"出生点转圈"的直接元凶——机体系前向速度在转圈时
+# 持续为正，权重 1.2 时转圈每步拿 ~0.6 奖励，比爬楼梯承受惩罚后的净收益还高。
+# 削到 0.3 后转圈收益 ~0.15/step，远低于 progress 在真前进时的 ~0.25/step，
+# 策略被迫选择"真正远离 spawn"而非"原地刷速度"。
+# Drastically reduced from 1.2 to 0.3: body-frame velocity rewards circling at
+# spawn; at 1.2 it dominated progress, making circles more profitable than climbing.
 [rewards.forward_velocity]
-# 权重 1.2：在保持 progress 为主信号的前提下，略微抬高持续前进意愿，
-# 直接针对下坡/台阶前犹豫、挂机与超时问题。
-# Slightly raised from 1.0 to 1.2 to reduce hesitation before descents and stairs
-# without letting body-frame speed dominate eval-aligned progress again.
-weight = 1.2
+weight = 0.3
 [rewards.forward_velocity.params]
 command_name = "base_velocity"
 max_speed = 1.0
@@ -228,18 +223,33 @@ unconditional = true
 # 评测 standard 模式按 `||pos_current - pos_spawn||` 计分，本项就是该指标的密集
 # 单步差分。直接对治"凹地形（pyramid_*_inv）spawn 周围转圈跑步不上坡"——原地
 # 画圈、来回往返都拿不到分，只有"持续远离 spawn"才被奖励。
-# 权重 18：比上一轮略回升，继续强调"持续远离 spawn"，
-# 但仍显著低于最初的 50，避免重新变成猛冲换时间。
-# Raised slightly from 15 to 18 to keep pressure against timeout/idling while
-# staying well below the overly aggressive regime.
+# 权重 25：forward_velocity 削到 0.3 后，progress 必须成为绝对主导信号。
+# 典型 0.5m/s 前进时 delta≈0.01m/step → 单步奖励 0.25，明显高于 forward_velocity
+# 的 0.15，策略只有"真正远离 spawn"才能拿到最大正奖励。
+# Raised from 18 to 25: with forward_velocity cut to 0.3, progress must clearly
+# dominate so the only way to maximize reward is actual world-frame displacement.
 [rewards.progress]
-weight = 18.0
+weight = 25.0
+
+# --- Negative: anti-stall (penalize circling / edge-stuck) ---
+# --- 负向：反停滞（惩罚转圈 / 台阶边卡住）---
+# 直接对治当前两大失败模式：
+# 1. pyramid_stairs_inv 出生点转圈——机体有速度但世界系位移为零
+# 2. 下楼梯卡在台阶边——腿在动但不前进
+# 权重 -0.5：与 forward_velocity(0.3) 同量级，确保”转圈”的净收益为负。
+# Directly targets circling-at-spawn and edge-stuck failures by penalizing
+# body-frame motion that produces no world-frame displacement.
+[rewards.stall_penalty]
+weight = -0.5
+[rewards.stall_penalty.params]
+vel_threshold = 0.15
+progress_threshold = 0.002
 
 # --- Negative: base stability ---
 # --- 负向：基座稳定 ---
 # 参考 NP3O：换成 *_up gated 版本，仅在直立时惩罚；
 # 上坡(pyramid_*_inv) 时机身天然 pitch 大，原本无门控的 lin_vel_z / ang_vel_xy /
-# flat_orientation 会大幅累积负奖励，导致 agent 学到“在斜坡上挂机不动”的退化策略。
+# flat_orientation 会大幅累积负奖励，导致 agent 学到”在斜坡上挂机不动”的退化策略。
 # Replace ungated penalties with NP3O-style `*_up` rewards that gate by upright
 # posture, so uphill terrains do not over-penalize and stall learning.
 [rewards.lin_vel_z_up]

@@ -346,29 +346,26 @@ class RewardProcess(RewardProcessBase):
         return 1.0 - asset.data.projected_gravity_b[:, 2]
 
     def _upright_gate(self):
-        """Asymmetric posture gate: floor=0.7 when descending, floor=0 when climbing.
+        """Asymmetric posture gate: floor=0.6 when descending, floor=0 when climbing.
 
         非对称门控：
         - 上坡（机头朝上，``projected_gravity_b[:, 0] > 0``）→ floor=0，回归 NP3O 原版
           完全释放姿态惩罚的行为，避免上坡时被姿态约束打击导致 agent 干脆不上坡。
-        - 下坡（机头朝下，``projected_gravity_b[:, 0] < 0``）→ floor=0.7，下楼/下坡
-          保留更强的姿态约束，针对当前评测中 `pyramid_stairs_inv` 的摔落问题。
-
-        关键修复：上一版统一 floor=0.5 是导致这次评测中 `倒台阶/倒斜坡`（上坡地形）
-        agent 在 spawn 周围转圈、不上坡的诱因之一——上坡时本就该释放的姿态惩罚被
-        硬性保留了下来；而对下楼来说 0.5 又不够抑制"砸下去"。
+        - 下坡（机头朝下，``projected_gravity_b[:, 0] < 0``）→ floor=0.6，下楼/下坡
+          保留适度姿态约束。从 0.7 回调到 0.6：0.7 过强导致下台阶时"尝试下行"的
+          惩罚过大，策略选择"卡在边缘不动"作为局部最优。
 
         IsaacLab 中 ``projected_gravity_b`` = 世界重力 (0,0,-g) 旋到机体系。
         机头上仰 → ``g_x > 0``；机头下俯 → ``g_x < 0``。
-        Asymmetric: fully release on climbs, but enforce a stronger floor on
-        descents to improve downhill stair stability.
+        Reduced descent floor from 0.7 to 0.6: too strict a descent gate made
+        "staying stuck on edge" cheaper than "attempting to step down".
         """
         asset = self._get_robot_asset()
         g_z = asset.data.projected_gravity_b[:, 2]
         g_x = asset.data.projected_gravity_b[:, 0]
         base = torch.clamp(-g_z, 0.0, 1.0)
         descending = (g_x < 0.0).float()
-        floor = descending * 0.7
+        floor = descending * 0.6
         return torch.maximum(base, floor)
 
     def _reward_lin_vel_z_up(self):
@@ -676,6 +673,44 @@ class RewardProcess(RewardProcessBase):
         # 仅奖励"远离 spawn"的位移；返回 m/step（典型 dt≈0.02s 时约 0.01 m/step）。
         # Reward only positive progress so back-and-forth motion does not accumulate.
         return torch.clamp(delta, min=0.0)
+
+    def _reward_stall_penalty(self, vel_threshold: float = 0.15, progress_threshold: float = 0.002):
+        """Penalize moving in body frame without making world-frame progress.
+
+        停滞惩罚：当机体系有速度（在跑）但世界系位移增量接近零（没有远离 spawn）时
+        给负奖励。直接对治两个失败模式：
+        1. "出生点转圈"——机体前向速度为正但 progress≈0
+        2. "台阶边卡住但腿在动"——有关节运动但不前进
+
+        不惩罚真正静止的情况（vel < threshold），避免和起步/恢复阶段冲突。
+        Penalizes "running but not advancing" — the circling and edge-stuck attractors.
+        """
+        asset = self._get_robot_asset()
+        body_speed = torch.norm(asset.data.root_lin_vel_b[:, :2], dim=1)
+        is_moving = (body_speed > vel_threshold).float()
+
+        pos = asset.data.root_pos_w[:, :2]
+        if hasattr(self.env.scene, "env_origins") and self.env.scene.env_origins is not None:
+            origin = self.env.scene.env_origins[:, :2]
+        else:
+            origin = torch.zeros_like(pos)
+        current_dist = torch.norm(pos - origin, dim=1)
+
+        prev = getattr(self, "_diy_stall_prev_dist", None)
+        if prev is None or prev.shape != current_dist.shape or prev.device != current_dist.device:
+            self._diy_stall_prev_dist = current_dist.clone()
+            return torch.zeros_like(current_dist)
+
+        delta = current_dist - self._diy_stall_prev_dist
+
+        term_mgr = self.env.termination_manager
+        reset_mask = term_mgr.terminated | term_mgr.time_outs
+        delta = torch.where(reset_mask, torch.zeros_like(delta), delta)
+
+        self._diy_stall_prev_dist = current_dist.clone()
+
+        no_progress = (delta < progress_threshold).float()
+        return is_moving * no_progress
 
     # --- Termination penalty / 终止惩罚 ---
     def _reward_termination(self):

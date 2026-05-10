@@ -17,6 +17,17 @@
 
 Lesson learned: terrain difficulty, push strength, and termination penalty must NOT be raised simultaneously. Each of these amplifies the others — harder terrain means more falls, stronger pushes mean more falls, higher fall penalty means the value function collapses when falls are frequent. These must be introduced one at a time, after the policy is already stable on the current difficulty.
 
+### Round 3 (fix circling-at-spawn and edge-stuck — overnight training)
+Root cause analysis:
+- "出生点转圈": `forward_velocity` (body-frame, weight=1.2) rewards circling; net reward from circling > net reward from climbing stairs with penalties
+- "下楼卡住": no penalty for zero progress; staying stuck has zero cost while stepping down triggers multiple penalties
+
+Changes:
+- `forward_velocity` weight: 1.2 → 0.3 (eliminate circling attractor — body-frame speed no longer profitable enough to beat progress)
+- `progress` weight: 18 → 25 (make world-frame displacement the absolute dominant signal)
+- NEW `stall_penalty` weight: -0.5 (penalize "body moving but no world-frame progress" — directly targets both circling and edge-stuck)
+- `_upright_gate` descent floor: 0.7 → 0.6 (reduce descent penalty so "attempt to step down" is cheaper than "stay stuck")
+
 ## Current status
 
 Eval scores after round 1:
