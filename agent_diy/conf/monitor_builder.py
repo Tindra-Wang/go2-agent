@@ -296,16 +296,6 @@ def build_monitor():
             expr="avg(reward_track_ang_vel_z{})",
         )
         .end_panel()
-        .add_panel(
-            name="前向速度密集奖励",
-            name_en="reward_forward_velocity",
-            type="line",
-        )
-        .add_metric(
-            metrics_name="reward_forward_velocity",
-            expr="avg(reward_forward_velocity{})",
-        )
-        .end_panel()
         .end_group()
         .add_group(
             group_name="奖励姿态与上坡",
@@ -394,26 +384,6 @@ def build_monitor():
         .add_metric(
             metrics_name="reward_feet_height_body",
             expr="avg(reward_feet_height_body{})",
-        )
-        .end_panel()
-        .add_panel(
-            name="对角腿镜像惩罚",
-            name_en="reward_foot_mirror_up",
-            type="line",
-        )
-        .add_metric(
-            metrics_name="reward_foot_mirror_up",
-            expr="avg(reward_foot_mirror_up{})",
-        )
-        .end_panel()
-        .add_panel(
-            name="移动期少于两足触地惩罚",
-            name_en="reward_no_fly",
-            type="line",
-        )
-        .add_metric(
-            metrics_name="reward_no_fly",
-            expr="avg(reward_no_fly{})",
         )
         .end_panel()
         .end_group()
@@ -524,26 +494,6 @@ def build_monitor():
         .add_metric(
             metrics_name="reward_reach_goal",
             expr="avg(reward_reach_goal{})",
-        )
-        .end_panel()
-        .add_panel(
-            name="静止期四足接触奖励",
-            name_en="reward_has_contact",
-            type="line",
-        )
-        .add_metric(
-            metrics_name="reward_has_contact",
-            expr="avg(reward_has_contact{})",
-        )
-        .end_panel()
-        .add_panel(
-            name="静止姿态回中惩罚",
-            name_en="reward_stand_nice",
-            type="line",
-        )
-        .add_metric(
-            metrics_name="reward_stand_nice",
-            expr="avg(reward_stand_nice{})",
         )
         .end_panel()
         .end_group()

@@ -216,12 +216,8 @@ def _aggregate_metrics(generic_metrics):
 
 def _collect_episode_metrics(ep_infos, reward_keys, device):
     generic_metrics = defaultdict(list)
-    metric_keys = set(reward_keys or [])
     for ep_info in ep_infos:
-        # Keep configured reward list, and auto-include dynamic reward terms
-        # so newly added reward_* metrics are not silently dropped.
-        metric_keys.update(k for k in ep_info.keys() if isinstance(k, str) and k.startswith("reward_"))
-        for key in metric_keys:
+        for key in reward_keys:
             metric_value = _extract_metric_value(ep_info, key, device)
             generic_metrics[key].append(metric_value)
     return _aggregate_metrics(generic_metrics)
@@ -274,9 +270,7 @@ def report_monitor_data(ep_infos, reward_keys, agent, monitor, episode, storage_
     if ep_infos:
         metrics = _collect_episode_metrics(ep_infos, reward_keys, agent.device)
         monitor_data.update(metrics)
-        monitor_data["episode_reward"] = sum(
-            value for key, value in monitor_data.items() if isinstance(key, str) and key.startswith("reward_")
-        )
+        monitor_data["episode_reward"] = sum(monitor_data.get(key, 0) for key in reward_keys)
 
     monitor.put_data({os.getpid(): _sanitize_monitor_data(monitor_data, logger=agent.logger)})
 
