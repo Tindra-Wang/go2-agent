@@ -497,6 +497,65 @@ def build_monitor():
         )
         .end_panel()
         .end_group()
+        # ==============================================================
+        # Group 9: Navigation rewards (track_nav.toml)
+        # Group 9：导航奖励（track 模式专用）
+        # ==============================================================
+        .add_group(
+            group_name="奖励导航",
+            group_name_en="reward_navigation",
+        )
+        .add_panel(
+            name="启发式导航奖励",
+            name_en="reward_heuristic_navigation",
+            type="line",
+        )
+        .add_metric(
+            metrics_name="reward_heuristic_navigation",
+            expr="avg(reward_heuristic_navigation{})",
+        )
+        .end_panel()
+        .add_panel(
+            name="死胡同逃脱奖励",
+            name_en="reward_deadend_escape",
+            type="line",
+        )
+        .add_metric(
+            metrics_name="reward_deadend_escape",
+            expr="avg(reward_deadend_escape{})",
+        )
+        .end_panel()
+        .add_panel(
+            name="近墙减速惩罚",
+            name_en="reward_wall_proximity_brake",
+            type="line",
+        )
+        .add_metric(
+            metrics_name="reward_wall_proximity_brake",
+            expr="avg(reward_wall_proximity_brake{})",
+        )
+        .end_panel()
+        .add_panel(
+            name="导航时间惩罚",
+            name_en="reward_navigation_time",
+            type="line",
+        )
+        .add_metric(
+            metrics_name="reward_navigation_time",
+            expr="avg(reward_navigation_time{})",
+        )
+        .end_panel()
+        .add_panel(
+            name="避障转向惩罚",
+            name_en="reward_obstacle_evasion",
+            type="line",
+        )
+        .add_metric(
+            metrics_name="reward_obstacle_evasion",
+            expr="avg(reward_obstacle_evasion{})",
+        )
+        .end_panel()
+        .end_group()
         .build()
     )
     return config_dict

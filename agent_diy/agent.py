@@ -43,12 +43,10 @@ class Agent(BaseAgent):
         env_conf = usr_conf["env"]
         self.num_envs = env_conf["num_envs"]
         self.num_actions = stage.num_actions
-        self.num_critic_obs = stage.num_critic_observations
+        self.num_goal_obs = int(getattr(stage, "num_goal_obs", 0))
+        self.num_critic_obs = stage.num_critic_observations + self.num_goal_obs
         self.proprio_dim = int(stage.num_proprio_obs)
-        self.base_num_obs = self.proprio_dim + int(stage.num_scan)
-        # 启用 HIM 历史编码器后，policy obs 末尾追加 history_len*proprio_dim 维历史。
-        # When the HIM history encoder is enabled, the policy obs is augmented with
-        # a trailing ``history_len * proprio_dim`` slice of past proprio observations.
+        self.base_num_obs = self.proprio_dim + int(stage.num_scan) + self.num_goal_obs
         self.history_len = int(getattr(stage, "history_len", 0)) if getattr(stage, "use_history_encoder", False) else 0
         self.num_obs = self.base_num_obs + self.history_len * self.proprio_dim
         self.num_steps_per_env = stage.num_steps_per_env
@@ -67,6 +65,7 @@ class Agent(BaseAgent):
             proprio_dim=self.proprio_dim,
             history_latent_dim=int(getattr(stage, "history_latent_dim", 16)),
             history_encoder_dims=list(getattr(stage, "history_encoder_dims", [128, 64])),
+            num_goal_obs=self.num_goal_obs,
         ).to(self.device)
         self.model = self.model.to(memory_format=torch.channels_last)
 

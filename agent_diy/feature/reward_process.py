@@ -318,6 +318,126 @@ class RewardProcess(RewardProcessBase):
         """
         return torch.ones(self.env.num_envs, device=self.env.device)
 
+    def _reward_heuristic_navigation(self, obstacle_threshold: float = -0.3):
+        """Main navigation signal: blend goal-tracking and clearance-following.
+
+        主导航信号：前方通畅时奖励朝 goal 方向前进，前方阻挡时奖励朝空旷侧转向。
+
+        Logic:
+        - Use height_scanner 16x16 grid to detect forward blockage.
+        - Clear ahead: reward = cos(heading_to_goal) * forward_speed (capped).
+        - Blocked ahead: reward = alignment with clearance direction (turn towards open side).
+        逻辑：
+        - 用 height_scanner 16x16 grid 检测前方阻挡。
+        - 前方通畅：reward = cos(朝向goal的角度) × 前向速度（截断）。
+        - 前方阻挡：reward = 朝空旷侧转向的对齐程度。
+        """
+        if not hasattr(self.env, "goal_positions") or self.env.goal_positions is None:
+            return torch.zeros(self.env.num_envs, device=self.env.device)
+
+        asset = self._get_robot_asset()
+        device = self.env.device
+
+        # --- Forward blockage detection (height_scanner, 16x16) ---
+        sensor = self.env.scene.sensors["height_scanner"]
+        scan = sensor.data.pos_w[:, 2:3] - sensor.data.ray_hits_w[..., 2]
+        grid = scan.view(self.env.num_envs, 16, 16)
+        # Body-width forward window: Y[4:12], X[:8] (near-field ~0.8m)
+        window = grid[:, 4:12, :8]
+        blocked_ratio = (window < obstacle_threshold).float().mean(dim=(1, 2))
+        clear = (blocked_ratio < 0.15).float()
+        blocked = 1.0 - clear
+
+        # --- Goal direction in robot frame ---
+        robot_pos = asset.data.root_pos_w[:, :2]
+        goal_pos = self.env.goal_positions[:, :2]
+        delta_world = goal_pos - robot_pos
+        # Robot heading from quaternion (wxyz)
+        quat = asset.data.root_quat_w
+        # yaw = atan2(2*(wz + xy), 1 - 2*(yy + zz))
+        yaw = torch.atan2(
+            2.0 * (quat[:, 0] * quat[:, 3] + quat[:, 1] * quat[:, 2]),
+            1.0 - 2.0 * (quat[:, 2] ** 2 + quat[:, 3] ** 2),
+        )
+        cos_yaw = torch.cos(yaw)
+        sin_yaw = torch.sin(yaw)
+        # World → body frame rotation (2D)
+        goal_body_x = cos_yaw * delta_world[:, 0] + sin_yaw * delta_world[:, 1]
+        goal_body_y = -sin_yaw * delta_world[:, 0] + cos_yaw * delta_world[:, 1]
+        goal_angle = torch.atan2(goal_body_y, goal_body_x)
+
+        # --- Clear path: reward forward speed projected onto goal direction ---
+        fwd_speed = torch.clamp(asset.data.root_lin_vel_b[:, 0], min=0.0, max=1.0)
+        cos_goal = torch.cos(goal_angle)
+        clear_reward = torch.clamp(cos_goal, min=0.0) * fwd_speed
+
+        # --- Blocked path: reward turning towards open side ---
+        left_clear = (grid[:, 0:6, :8] < obstacle_threshold).float().mean(dim=(1, 2))
+        right_clear = (grid[:, 10:16, :8] < obstacle_threshold).float().mean(dim=(1, 2))
+        # Desired turn: positive yaw_rate = turn left, negative = turn right
+        desired_sign = torch.where(left_clear < right_clear, -torch.ones(self.env.num_envs, device=device), torch.ones(self.env.num_envs, device=device))
+        # Also bias towards goal side
+        goal_sign = torch.sign(goal_angle)
+        desired_sign = torch.where(torch.abs(left_clear - right_clear) < 0.1, goal_sign, desired_sign)
+        yaw_rate = asset.data.root_ang_vel_b[:, 2]
+        blocked_reward = torch.clamp(desired_sign * yaw_rate, min=0.0, max=1.5)
+
+        return clear * clear_reward + blocked * blocked_reward
+
+    def _reward_deadend_escape(self, obstacle_threshold: float = -0.3, trapped_threshold: float = 0.3):
+        """Reward turning when trapped in a dead-end (nav_scanner wider range).
+
+        死胡同逃脱：用 nav_scanner（范围更大）检测大面积阻挡，奖励转向。
+
+        When forward path is heavily blocked (ratio > trapped_threshold),
+        reward angular velocity magnitude to encourage escape turning.
+        当前方大面积阻挡（ratio > trapped_threshold）时，奖励角速度幅度以鼓励转向逃脱。
+        """
+        asset = self._get_robot_asset()
+
+        # Use nav_scanner if available, fallback to height_scanner
+        if "nav_scanner" in self.env.scene.sensors:
+            sensor = self.env.scene.sensors["nav_scanner"]
+        else:
+            sensor = self.env.scene.sensors["height_scanner"]
+
+        scan = sensor.data.pos_w[:, 2:3] - sensor.data.ray_hits_w[..., 2]
+        n_rays = scan.shape[1]
+        # Treat as 1D forward scan: fraction of rays hitting obstacles
+        blocked_ratio = (scan.squeeze(-1) < obstacle_threshold).float().mean(dim=1) if scan.ndim == 2 else (scan < obstacle_threshold).float().view(self.env.num_envs, -1).mean(dim=1)
+
+        trapped = (blocked_ratio > trapped_threshold).float()
+
+        # Reward turning speed when trapped
+        yaw_rate = torch.abs(asset.data.root_ang_vel_b[:, 2])
+        turn_reward = torch.clamp(yaw_rate, max=2.0)
+
+        return trapped * turn_reward
+
+    def _reward_wall_proximity_brake(self, obstacle_threshold: float = -0.3):
+        """Penalize high forward speed when wall is detected nearby.
+
+        近墙减速：前方近距离有墙时惩罚高前向速度。
+
+        Uses height_scanner near-field (first 4 columns ≈ 0~0.4m) to detect
+        imminent collision, then penalizes forward velocity proportionally.
+        用 height_scanner 近场（前 4 列 ≈ 0~0.4m）检测即将碰撞，
+        按比例惩罚前向速度。
+        """
+        asset = self._get_robot_asset()
+        sensor = self.env.scene.sensors["height_scanner"]
+
+        scan = sensor.data.pos_w[:, 2:3] - sensor.data.ray_hits_w[..., 2]
+        grid = scan.view(self.env.num_envs, 16, 16)
+
+        # Very near-field: body-width Y[4:12], X[:4] (0~0.4m ahead)
+        near_window = grid[:, 4:12, :4]
+        wall_proximity = (near_window < obstacle_threshold).float().mean(dim=(1, 2))
+
+        # Penalize forward speed proportional to wall proximity
+        fwd_speed = torch.clamp(asset.data.root_lin_vel_b[:, 0], min=0.0)
+        return wall_proximity * fwd_speed
+
     # -----------------------------------------------------------------------
     # NP3O-style gait & uphill rewards
     # NP3O 风格的步态/上坡奖励

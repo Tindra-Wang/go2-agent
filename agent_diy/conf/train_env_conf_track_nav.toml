@@ -190,17 +190,18 @@ weight = 0.1
 std = 0.25
 command_name = "base_velocity"
 
-# --- Negative: base stability ---
-# --- 负向：基座稳定 ---
-[rewards.lin_vel_z]
-# Penalty on vertical linear velocity.
-# Z 方向线速度惩罚（抑制上下跳跃）
-weight = -2.0
+# --- Negative: base stability (gated by upright posture, avoids over-penalizing on slopes) ---
+# --- 负向：基座稳定（直立门控，避免坡道上过度惩罚）---
+[rewards.lin_vel_z_up]
+weight = -0.75
 
-[rewards.ang_vel_xy]
-# Penalty on pitch/roll angular velocity.
-# X/Y 方向角速度惩罚（抑制 pitch/roll 抖动）
-weight = -0.05
+[rewards.ang_vel_xy_up]
+weight = -0.08
+
+# --- Negative: posture (gated) ---
+# --- 负向：姿态（门控版）---
+[rewards.orientation_up]
+weight = -0.3
 
 # --- Negative: joint smoothness ---
 # --- 负向：关节 ---
@@ -276,17 +277,40 @@ tanh_mult = 2.0
 [rewards.hip_to_default]
 weight = -0.05
 
+# --- Gait: long stride ---
+# --- 步态：长步幅 ---
+[rewards.feet_air_time]
+weight = 0.25
+[rewards.feet_air_time.params]
+command_name = "base_velocity"
+threshold = 0.5
+
+# --- Gait: anti-air (require >=2 feet contact when moving) ---
+# --- 步态：反离地（移动中至少 2 足触地）---
+[rewards.no_fly]
+weight = -1.0
+[rewards.no_fly.params]
+command_threshold = 0.1
+
+# --- Gait: diagonal-leg mirror symmetry ---
+# --- 步态：对角腿镜像对称 ---
+[rewards.foot_mirror_up]
+weight = -0.08
+
+# --- Gait: anti-slide during stance ---
+# --- 步态：支撑期防滑 ---
+[rewards.feet_slide]
+weight = -0.03
+
+# --- Gait: foot contact force cap ---
+# --- 步态：足部接触力上限 ---
+[rewards.feet_contact_forces]
+weight = -1.5e-4
+
 # --- Termination penalty (high weight so falling cost >> discounted wall-rush reward) ---
 # --- 终止惩罚（提高权重，撞死代价远超冲墙折扣收益）---
 [rewards.termination]
 weight = -10.0
-
-# --- Anti-tipping ---
-# --- 防倾倒 ---
-[rewards.flat_orientation]
-# Penalty on deviation from flat base orientation.
-# 基座偏离水平姿态的惩罚
-weight = -1.5
 
 # --- Anti-stumbling ---
 # --- 防绊倒 ---

@@ -84,6 +84,7 @@ class Model(nn.Module):
         proprio_dim: int | None = None,
         history_latent_dim: int = 16,
         history_encoder_dims: list[int] | tuple[int, ...] | None = None,
+        num_goal_obs: int = 0,
         **kwargs: dict[str, Any],
     ) -> None:
         super(Model, self).__init__()
@@ -93,6 +94,7 @@ class Model(nn.Module):
         self.num_critic_obs = num_critic_obs if num_critic_obs is not None else stage.num_critic_observations
         self.num_actions = num_actions if num_actions is not None else stage.num_actions
         self.num_costs = num_costs if num_costs is not None else stage.num_costs
+        self.num_goal_obs = int(num_goal_obs)
 
         actor_hidden_dims = actor_hidden_dims or stage.actor_hidden_dims
         critic_hidden_dims = critic_hidden_dims or stage.critic_hidden_dims
@@ -120,7 +122,9 @@ class Model(nn.Module):
                 latent_dim=self.history_latent_dim,
                 activation_fn=activation_fn,
             )
-            actor_input_dim = self.base_obs_dim + self.history_latent_dim
+            # Actor input: [proprio+scan | history_latent | goal]
+            # goal 放在最后，确保从 standard 热加载时前面的权重位置完全对齐
+            actor_input_dim = (self.base_obs_dim - self.num_goal_obs) + self.history_latent_dim + self.num_goal_obs
         else:
             self.history_encoder = None
             actor_input_dim = self.num_obs
@@ -186,13 +190,26 @@ class Model(nn.Module):
 
         编码末尾的历史片段，并与当前 proprio+scan 拼接，作为 actor 输入。
         若未开启历史编码器，则原样返回。
+
+        Layout: obs = [proprio+scan | goal | history_raw]
+        Actor input = [proprio+scan | history_latent | goal]
+        goal 放在最后确保热加载时前面的权重位置与 standard 模型完全对齐。
         """
         if self.history_encoder is None:
             return obs
-        base = obs[..., : self.base_obs_dim]
-        history = obs[..., self.base_obs_dim :]
+        # Split: [proprio+scan(base_obs_dim - goal) | goal(num_goal_obs) | history(history_total)]
+        core_dim = self.base_obs_dim - self.num_goal_obs
+        core = obs[..., :core_dim]
+        if self.num_goal_obs > 0:
+            goal = obs[..., core_dim:core_dim + self.num_goal_obs]
+            history = obs[..., core_dim + self.num_goal_obs:]
+        else:
+            goal = None
+            history = obs[..., core_dim:]
         latent = self.history_encoder(history)
-        return torch.cat([base, latent], dim=-1)
+        if goal is not None:
+            return torch.cat([core, latent, goal], dim=-1)
+        return torch.cat([core, latent], dim=-1)
 
     def update_distribution(self, obs: torch.Tensor):
         actor_in = self._actor_input(obs)
