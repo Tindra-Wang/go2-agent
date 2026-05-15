@@ -131,8 +131,12 @@ class NavConfig(StageConfig):
     name = "nav"
     task_type = "track"
 
-    # goal obs: [rel_x, rel_y, rel_dist, rel_yaw] in robot frame
-    num_goal_obs = 4
+    # goal obs (4): [rel_x, rel_y, rel_dist, rel_yaw]
+    # + nav_scanner sectors (7): [sector_0..4, min_ahead, best_direction]
+    # Total: 11 dim
+    num_goal_obs = 11
+    # critic: 316 (base) + 11 (goal) = 327 (agent.py adds num_goal_obs automatically)
+    num_critic_observations = 316
 
     # Fine-tune learning rate (lower than locomotion stage)
     lr = 1e-4
