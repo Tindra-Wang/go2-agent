@@ -197,6 +197,51 @@ class Agent(BaseAgent):
             return
 
         pretrained = torch.load(model_file_path, map_location=self.device)
-        self.model.load_state_dict(pretrained)
+        current_state = self.model.state_dict()
+
+        has_mismatch = False
+        for key in pretrained:
+            if key in current_state and pretrained[key].shape != current_state[key].shape:
+                has_mismatch = True
+                break
+
+        if not has_mismatch:
+            self.model.load_state_dict(pretrained)
+            self.logger.info(f"load model {model_file_path} successfully (exact match)")
+        else:
+            self._load_model_partial(self.model, pretrained, model_file_path)
+
         self.cur_model_name = model_file_path
-        self.logger.info(f"load model {model_file_path} successfully")
+
+    def _load_model_partial(self, model, pretrained, model_file_path):
+        current_state = model.state_dict()
+        loaded_keys = []
+        partial_keys = []
+        skipped_keys = []
+
+        for key in current_state:
+            if key not in pretrained:
+                skipped_keys.append(key)
+                continue
+
+            old_param = pretrained[key]
+            new_param = current_state[key]
+
+            if old_param.shape == new_param.shape:
+                new_param.copy_(old_param)
+                loaded_keys.append(key)
+            else:
+                with torch.no_grad():
+                    new_param.zero_()
+                    slices = tuple(slice(0, min(o, n)) for o, n in zip(old_param.shape, new_param.shape))
+                    new_param[slices] = old_param[slices]
+                partial_keys.append(f"{key} {list(old_param.shape)}->{list(new_param.shape)}")
+
+        model.load_state_dict(current_state)
+
+        self.logger.info(
+            f"Partial load model {model_file_path}: "
+            f"{len(loaded_keys)} exact, {len(partial_keys)} partial, {len(skipped_keys)} skipped"
+        )
+        for info in partial_keys:
+            self.logger.info(f"  Partial: {info}")
