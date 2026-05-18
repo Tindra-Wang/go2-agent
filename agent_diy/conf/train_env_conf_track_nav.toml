@@ -130,7 +130,7 @@ pos = [0.0, 0.0, 0.35]
 [commands]
 # Velocity command resampling interval [min, max] (seconds).
 # 速度命令重采样区间 [min, max]（秒）
-resampling_time = [5.0, 5.0]
+resampling_time = [15.0, 15.0]
 
 [commands.limit]
 # Velocity command **hard limits** (curriculum may expand sampling range up to here).
@@ -138,15 +138,15 @@ resampling_time = [5.0, 5.0]
 
 # X linear velocity range (m/s) — low speed for comfortable turning in mazes.
 # X 方向线速度范围 (m/s) — 迷宫低速，转弯从容
-lin_vel_x = [0.0, 0.8]
+lin_vel_x = [0.3, 0.8]
 
 # Y linear velocity range (m/s) — narrowed to suppress strafing.
 # Y 方向线速度范围 (m/s) — 收窄侧向，抑制侧移
-lin_vel_y = [-0.3, 0.3]
+lin_vel_y = [-0.2, 0.2]
 
 # Yaw angular velocity range (rad/s) — kept wide for wall circumvention.
 # Z 轴角速度范围 (rad/s) — 保持，导航绕墙需要
-ang_vel_z = [-1.5, 1.5]
+ang_vel_z = [-0.6, 0.6]
 
 [commands.ranges]
 # Velocity command **initial sampling ranges** (expand towards limit when curriculum is enabled).
@@ -154,13 +154,13 @@ ang_vel_z = [-1.5, 1.5]
 
 # Normal forward speed.
 # 常规前进
-lin_vel_x = [0.0, 0.5]
+lin_vel_x = [0.3, 0.6]
 
 # Narrowed lateral.
 # 收窄侧向
-lin_vel_y = [-0.15, 0.15]
+lin_vel_y = [-0.1, 0.1]
 
-ang_vel_yaw = [-1.0, 1.0]
+ang_vel_yaw = [-0.5, 0.5]
 
 
 # =====================================================================
@@ -175,7 +175,7 @@ ang_vel_yaw = [-1.0, 1.0]
 # --- Positive: velocity tracking (down-weighted so navigation signal dominates) ---
 # --- 正向：速度跟踪（降权，让导航信号主导）---
 [rewards.track_lin_vel_xy]
-weight = 0.15
+weight = 0.5
 [rewards.track_lin_vel_xy.params]
 # Std of Gaussian kernel, controls how sharp the error → reward decay is.
 # 高斯核标准差，控制误差 → 奖励的衰减陡峭程度
@@ -185,7 +185,7 @@ std = 0.25
 command_name = "base_velocity"
 
 [rewards.track_ang_vel_z]
-weight = 0.1
+weight = 0.25
 [rewards.track_ang_vel_z.params]
 std = 0.25
 command_name = "base_velocity"
@@ -241,12 +241,12 @@ target_height = 0.38
 [rewards.action_rate]
 # Delta between consecutive actions (1st order).
 # 相邻动作差（一阶）
-weight = -0.01
+weight = -0.03
 
 [rewards.action_smoothness]
 # 2nd-order action smoothness.
 # 动作二阶平滑
-weight = -0.01
+weight = -0.03
 
 # --- Negative: undesired contacts ---
 # --- 负向：碰撞 ---
@@ -295,12 +295,12 @@ command_threshold = 0.1
 # --- Gait: diagonal-leg mirror symmetry ---
 # --- 步态：对角腿镜像对称 ---
 [rewards.foot_mirror_up]
-weight = -0.08
+weight = -0.12
 
 # --- Gait: anti-slide during stance ---
 # --- 步态：支撑期防滑 ---
 [rewards.feet_slide]
-weight = -0.03
+weight = -0.05
 
 # --- Gait: foot contact force cap ---
 # --- 步态：足部接触力上限 ---
@@ -317,12 +317,12 @@ weight = -10.0
 [rewards.feet_stumble]
 # Penalty when foot hits edge: horizontal force >> vertical.
 # 脚碰台阶边缘时水平力 >> 垂直力的惩罚
-weight = -0.1
+weight = -0.2
 
 # --- Avoidance: penalize not turning when blocked ahead ---
 # --- 避障：前方被障碍阻挡时未主动转向的惩罚 ---
 [rewards.obstacle_evasion]
-weight = -1.0
+weight = -1.5
 [rewards.obstacle_evasion.params]
 command_name = "base_velocity"
 
@@ -335,7 +335,7 @@ command_name = "base_velocity"
 # Main navigation: the only positive nav signal (clear ahead → towards goal; blocked → by clearance).
 # 主导航：唯一的正向导航信号（前方通 → 朝 goal；堵 → 按 clearance 走）
 [rewards.heuristic_navigation]
-weight = 8.0
+weight = 3.5
 [rewards.heuristic_navigation.params]
 # Obstacle threshold (height delta in meters, negative = wall/pit).
 # 障碍判定阈值（高度差，米，负值 = 下凹/墙）
@@ -344,7 +344,7 @@ obstacle_threshold = -0.3
 # Fallback when blocked: reward turning (nav_scanner detects L-shaped turns 2.5m ahead).
 # 前方堵兜底：奖励转向（nav_scanner 2.5m 提前检测 L 型转角）
 [rewards.deadend_escape]
-weight = 4.0
+weight = 1.25
 [rewards.deadend_escape.params]
 obstacle_threshold = -0.3
 # Trapped threshold (0~1, larger = more lenient).
@@ -354,7 +354,7 @@ trapped_threshold = 0.3
 # Wall-proximity brake: penalize high forward speed near walls.
 # 近墙减速：前方有墙时惩罚高速前冲
 [rewards.wall_proximity_brake]
-weight = -3.0
+weight = -3.5
 [rewards.wall_proximity_brake.params]
 obstacle_threshold = -0.3
 
