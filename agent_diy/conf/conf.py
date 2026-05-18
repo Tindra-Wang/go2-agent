@@ -114,7 +114,7 @@ class StageConfig:
 
     # --- Saving
     # 保存 ---
-    model_save_interval = 500
+    model_save_interval = 100
 
 
 class NavConfig(StageConfig):
