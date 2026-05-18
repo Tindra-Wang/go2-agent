@@ -175,7 +175,7 @@ class RewardProcess(RewardProcessBase):
         self,
         command_name: str = "base_velocity",
         obstacle_threshold: float = -0.3,
-        near_x_end: int = 10,
+        near_x_end: int = 12,
         body_y_start: int = 3,
         body_y_end: int = 13,
         turn_std: float = 0.5,
