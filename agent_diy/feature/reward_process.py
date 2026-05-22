@@ -512,6 +512,38 @@ class RewardProcess(RewardProcessBase):
         asset = self._get_robot_asset()
         return torch.sum(torch.square(asset.data.projected_gravity_b[:, :2]), dim=1) * self._upright_gate()
 
+    def _reward_lateral_sway(
+        self,
+        command_name: str = "base_velocity",
+        command_threshold: float = 0.05,
+        forward_speed_threshold: float = 0.05,
+        lateral_vel_scale: float = 1.0,
+        roll_rate_scale: float = 0.25,
+        roll_tilt_scale: float = 1.0,
+    ):
+        """Penalize side-to-side sway without suppressing stair-climbing pitch.
+
+        楼梯上左右晃主要表现为 body-frame 侧向速度、roll 角速度和 roll 倾斜；
+        这里仅约束这些横向分量，不惩罚 pitch，因此不会压制上台阶所需的机身仰角。
+        """
+        asset = self._get_robot_asset()
+        cmd = self.env.command_manager.get_command(command_name)
+
+        fwd_cmd = cmd[:, 0] > command_threshold
+        fwd_speed = asset.data.root_lin_vel_b[:, 0] > forward_speed_threshold
+        moving_forward = torch.logical_or(fwd_cmd, fwd_speed).float()
+
+        lateral_vel = asset.data.root_lin_vel_b[:, 1]
+        roll_rate = asset.data.root_ang_vel_b[:, 0]
+        roll_tilt = asset.data.projected_gravity_b[:, 1]
+
+        penalty = (
+            lateral_vel_scale * torch.square(lateral_vel)
+            + roll_rate_scale * torch.square(roll_rate)
+            + roll_tilt_scale * torch.square(roll_tilt)
+        )
+        return penalty * moving_forward * self._upright_gate()
+
     # ----- Joint index helpers (IsaacLab Go2 joints are alphabetically grouped) -----
     # IsaacLab Go2 关节顺序按"先类型后腿名"字典序排列：
     #   [FL_hip, FR_hip, RL_hip, RR_hip,  FL_thigh, FR_thigh, RL_thigh, RR_thigh,
@@ -760,7 +792,7 @@ class RewardProcess(RewardProcessBase):
         真正**远离 spawn** 时才给正奖励，原地画圈跑、来回往返都拿不到分。
         与 ``forward_velocity`` 的差异：后者是机体系前向速度，原地转圈跑也可以
         持续为正；本项基于世界系下"距离 spawn 的位移"，对应 standard 模式评分
-        的 ``\|pos_current - pos_spawn\|`` 公式，是与评测目标最对齐的密集信号。
+        的 ``\\|pos_current - pos_spawn\\|`` 公式，是与评测目标最对齐的密集信号。
 
         实现：用上一步距离与当前距离的差。回合重置时清零，避免起步跳变。
         Mirrors the standard-mode scoring metric (||pos_current - pos_spawn||);

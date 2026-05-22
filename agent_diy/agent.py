@@ -44,9 +44,10 @@ class Agent(BaseAgent):
         self.num_envs = env_conf["num_envs"]
         self.num_actions = stage.num_actions
         self.num_goal_obs = int(getattr(stage, "num_goal_obs", 0))
-        self.num_critic_obs = stage.num_critic_observations + self.num_goal_obs
+        self.num_nav_scan_obs = int(getattr(stage, "num_nav_scan_obs", 0))
+        self.num_critic_obs = int(stage.num_critic_observations) + self.num_goal_obs + self.num_nav_scan_obs
         self.proprio_dim = int(stage.num_proprio_obs)
-        self.base_num_obs = self.proprio_dim + int(stage.num_scan) + self.num_goal_obs
+        self.base_num_obs = self.proprio_dim + int(stage.num_scan) + self.num_goal_obs + self.num_nav_scan_obs
         self.history_len = int(getattr(stage, "history_len", 0)) if getattr(stage, "use_history_encoder", False) else 0
         self.num_obs = self.base_num_obs + self.history_len * self.proprio_dim
         self.num_steps_per_env = stage.num_steps_per_env
@@ -66,10 +67,14 @@ class Agent(BaseAgent):
             history_latent_dim=int(getattr(stage, "history_latent_dim", 16)),
             history_encoder_dims=list(getattr(stage, "history_encoder_dims", [128, 64])),
             num_goal_obs=self.num_goal_obs,
+            num_nav_scan_obs=self.num_nav_scan_obs,
+            nav_scan_latent_dim=int(getattr(stage, "nav_scan_latent_dim", 16)),
+            nav_scan_cnn_channels=list(getattr(stage, "nav_scan_cnn_channels", [16, 32])),
         ).to(self.device)
         self.model = self.model.to(memory_format=torch.channels_last)
 
         self.logger.info(f"DIY Actor MLP: {self.model.actor}")
+        self.logger.info(f"DIY NavScan CNN: {self.model.nav_scan_encoder}")
         self.logger.info(f"DIY Critic MLP: {self.model.critic}")
         self.logger.info(f"DIY Cost Critic MLP: {self.model.cost_critic}")
 

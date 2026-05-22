@@ -6,51 +6,80 @@
 CriticObservationProcess — custom critic observation processor.
 CriticObservationProcess — 自定义 critic 观测处理器。
 
-critic obs layout: [critic_proprio(60) | height_scan(256) | goal(num_goal_obs)]
-- Stage1/2: num_goal_obs=0  → critic_obs = 316 dim
-- Stage3:   num_goal_obs=11 → critic_obs = 60 + 256 + 4 + 7 = 327 dim
-critic 观测布局：[critic_proprio(60) | height_scan(256) | goal(num_goal_obs)]
-- Stage1/2：num_goal_obs=0  → critic_obs = 316 维
-- Stage3：  num_goal_obs=11 → critic_obs = 60 + 256 + 4 + 7 = 327 维
+critic obs layout: [critic_proprio(60) | height_scan(256) | goal(4) | raw_nav_scan(num_nav_scan_obs)]
+- Stage1/2: num_goal_obs=0, num_nav_scan_obs=0 → critic_obs = 316 dim
+- Stage3:   num_goal_obs=4, num_nav_scan_obs=32
+            → critic_obs = 316 + goal(4) + raw_nav_scan(32) = 352 dim
+critic 观测布局：[critic_proprio(60) | height_scan(256) | goal(4) | raw_nav_scan(num_nav_scan_obs)]
+- Stage1/2：num_goal_obs=0, num_nav_scan_obs=0 → critic_obs = 316 维
+- Stage3：  num_goal_obs=4, num_nav_scan_obs=32
+            → critic_obs = 316 + goal(4) + raw_nav_scan(32) = 352 维
 """
 
 import torch
+import torch.nn.functional as F
 
 from tools.base_env.observation_process import ObservationProcess, yaw_from_quat, wrap_to_pi
-from agent_diy.feature.policy_observation_process import NUM_NAV_SECTORS, NUM_NAV_FEATURES
 
 
 class CriticObservationProcess(ObservationProcess):
-    """Critic observation processor with optional goal obs and nav_scanner sectors.
+    """Critic observation processor with goal obs plus raw nav scan for 1D CNN.
 
-    与 Isaac Lab CriticCfg 对齐的 critic 观测处理器，可选拼接 goal obs + nav 扇区特征。
+    critic 保留 goal 特征，并追加 raw nav_scanner 给 value/cost critic 的 1D CNN 使用。
     """
 
     target_group = "critic"
 
+    def _get_num_nav_scan_obs(self) -> int:
+        """Read raw nav_scanner obs dim from the active stage config."""
+        cached = getattr(self, "_num_nav_scan_obs", None)
+        if cached is not None:
+            return cached
+
+        from agent_diy.conf.conf import Config
+
+        num_nav_scan_obs = int(getattr(Config.CURRENT, "num_nav_scan_obs", 0))
+        self._num_nav_scan_obs = num_nav_scan_obs
+        return num_nav_scan_obs
+
     def process(self):
-        """Compute critic observation.
-
-        计算 critic 观测。
-
-        Stage1/2: critic_obs = 316
-        Stage3:   critic_obs = 316 + goal(4) + nav_sectors(7) = 327
-        """
+        """Compute critic observation."""
         obs = self.default_observation()
 
         if self._get_num_goal_obs() > 0:
             goal_obs = self._goal_position_in_robot_frame()
-            nav_obs = self._nav_scanner_sector_features()
-            obs = self.concatenate_terms(obs, goal_obs, nav_obs)
+            obs = self.concatenate_terms(obs, goal_obs)
+
+        if self._get_num_nav_scan_obs() > 0:
+            nav_scan = self._nav_scanner_raw_scan()
+            obs = self.concatenate_terms(obs, nav_scan)
 
         return obs
 
-    def _goal_position_in_robot_frame(self):
-        """Compute goal position relative to robot in body frame (4 dim).
+    def _nav_scanner_raw_scan(self):
+        """Return normalized raw nav_scanner rays for critic-side 1D CNNs."""
+        env = self.env
+        device = env.device
+        num_envs = env.num_envs
+        target_dim = self._get_num_nav_scan_obs()
 
-        计算目标点在机器人坐标系下的相对位置（4 维）。
-        Returns: [rel_x, rel_y, rel_dist, rel_yaw] shape=(num_envs, 4)
-        """
+        if target_dim <= 0:
+            return torch.zeros(num_envs, 0, device=device)
+
+        if not hasattr(env, "scene") or "nav_scanner" not in env.scene.sensors:
+            return torch.zeros(num_envs, target_dim, device=device)
+
+        sensor = env.scene.sensors["nav_scanner"]
+        scan = sensor.data.pos_w[:, 2:3] - sensor.data.ray_hits_w[..., 2]
+        scan = (scan.clamp(-1.0, 5.0) + 1.0) / 6.0
+
+        if scan.shape[1] != target_dim:
+            scan = F.interpolate(scan.unsqueeze(1), size=target_dim, mode="linear", align_corners=False).squeeze(1)
+
+        return scan
+
+    def _goal_position_in_robot_frame(self):
+        """Compute goal position relative to robot in body frame (4 dim)."""
         env = self.env
         device = env.device
         num_envs = env.num_envs
@@ -61,7 +90,6 @@ class CriticObservationProcess(ObservationProcess):
         robot = self._get_robot()
         robot_pos = robot.data.root_pos_w[:, :2]
         goal_pos = env.goal_positions[:, :2]
-
         delta_world = goal_pos - robot_pos
 
         quat = robot.data.root_quat_w
@@ -73,52 +101,11 @@ class CriticObservationProcess(ObservationProcess):
         rel_y = -sin_yaw * delta_world[:, 0] + cos_yaw * delta_world[:, 1]
         rel_dist = torch.norm(delta_world, dim=1)
 
-        goal_yaw = env.goal_yaw if hasattr(env, "goal_yaw") and env.goal_yaw is not None else torch.zeros(num_envs, device=device)
+        goal_yaw = (
+            env.goal_yaw
+            if hasattr(env, "goal_yaw") and env.goal_yaw is not None
+            else torch.zeros(num_envs, device=device)
+        )
         rel_yaw = wrap_to_pi(goal_yaw - yaw)
 
         return torch.stack([rel_x, rel_y, rel_dist, rel_yaw], dim=-1)
-
-    def _nav_scanner_sector_features(self):
-        """Extract sector-based clearance features from nav_scanner (7 dim).
-
-        从 nav_scanner 提取扇区通行距离特征（7 维）。
-        """
-        env = self.env
-        device = env.device
-        num_envs = env.num_envs
-
-        if not hasattr(env, "scene") or "nav_scanner" not in env.scene.sensors:
-            return torch.zeros(num_envs, NUM_NAV_FEATURES, device=device)
-
-        sensor = env.scene.sensors["nav_scanner"]
-        scan = sensor.data.pos_w[:, 2:3] - sensor.data.ray_hits_w[..., 2]
-
-        n_rays = scan.shape[1]
-        sector_size = n_rays // NUM_NAV_SECTORS
-        remainder = n_rays - sector_size * NUM_NAV_SECTORS
-
-        sector_clearances = []
-        start = 0
-        for i in range(NUM_NAV_SECTORS):
-            end = start + sector_size + (1 if i < remainder else 0)
-            sector_data = scan[:, start:end]
-            sector_clearances.append(sector_data.mean(dim=1))
-            start = end
-
-        sectors = torch.stack(sector_clearances, dim=1)
-        sectors_norm = (sectors.clamp(-1.0, 5.0) + 1.0) / 6.0
-
-        center_start = (sector_size + (1 if 0 < remainder else 0)) + (sector_size + (1 if 1 < remainder else 0))
-        center_end = center_start + sector_size + (1 if 2 < remainder else 0)
-        center_data = scan[:, center_start:center_end]
-        min_ahead = center_data.min(dim=1).values
-        min_ahead_norm = (min_ahead.clamp(-1.0, 5.0) + 1.0) / 6.0
-
-        best_idx = sectors_norm.argmax(dim=1).float()
-        best_direction = (best_idx / (NUM_NAV_SECTORS - 1)) * 2.0 - 1.0
-
-        return torch.cat([
-            sectors_norm,
-            min_ahead_norm.unsqueeze(1),
-            best_direction.unsqueeze(1),
-        ], dim=1)

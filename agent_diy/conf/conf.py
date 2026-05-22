@@ -41,6 +41,7 @@ class StageConfig:
     num_proprio_obs = 45  # proprioceptive obs dim / 本体感知观测维度
     num_scan = 256  # 16x16 height-scan dim / 16x16 高度扫描维度
     num_goal_obs = 0  # optional goal observation dim / 可选 goal 观测维度
+    num_nav_scan_obs = 0  # optional raw nav_scanner dim for 1D CNN / 可选 nav_scanner 原始序列维度
     num_critic_observations = 316  # proprio(45) + scan(256) + privileged(15)
 
     # --- Model architecture
@@ -111,6 +112,8 @@ class StageConfig:
     history_len = 10  # NP3O Go2ConstraintHimRoughCfg.env.history_len
     history_latent_dim = 16
     history_encoder_dims = [128, 64]
+    nav_scan_latent_dim = 16
+    nav_scan_cnn_channels = [16, 32]
 
     # --- Saving
     # 保存 ---
@@ -122,20 +125,25 @@ class NavConfig(StageConfig):
     Stage: nav — end-to-end navigation on track terrain.
     阶段：nav —— track 地形端到端导航训练。
 
-    Hot-loads from a LocomotionConfig checkpoint; the extra goal obs (4 dim)
-    triggers partial weight loading via _load_model_partial.
-    从 LocomotionConfig checkpoint 热加载；新增的 goal obs（4 维）
-    通过 _load_model_partial 实现部分权重加载。
+    Hot-loads from a LocomotionConfig checkpoint; goal obs stay explicit while
+    raw nav_scanner rays are consumed by the actor-side 1D CNN instead of
+    hand-crafted nav sectors.
+    从 LocomotionConfig checkpoint 热加载；goal 观测仍显式拼接，raw nav_scanner
+    由 actor 端 1D CNN 消费，不再拼接手工 nav sector 特征。
     """
 
     name = "nav"
     task_type = "track"
 
     # goal obs (4): [rel_x, rel_y, rel_dist, rel_yaw]
-    # + nav_scanner sectors (7): [sector_0..4, min_ahead, best_direction]
-    # Total: 11 dim
-    num_goal_obs = 11
-    # critic: 316 (base) + 11 (goal) = 327 (agent.py adds num_goal_obs automatically)
+    # Raw nav_scanner rays are appended to policy obs and consumed by the
+    # actor-side 1D CNN. No hand-crafted nav_sector features are appended.
+    num_goal_obs = 4
+    num_nav_scan_obs = 32
+    nav_scan_latent_dim = 16
+    nav_scan_cnn_channels = [16, 32]
+    # critic: 316 (base) + 4 (goal) + 32 (raw nav scan) = 352
+    # agent.py adds goal/raw nav dims automatically.
     num_critic_observations = 316
 
     # Fine-tune learning rate (lower than locomotion stage)
