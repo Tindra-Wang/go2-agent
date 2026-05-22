@@ -112,7 +112,7 @@ class StageConfig:
     history_len = 10  # NP3O Go2ConstraintHimRoughCfg.env.history_len
     history_latent_dim = 16
     history_encoder_dims = [128, 64]
-    nav_scan_latent_dim = 16
+    nav_scan_latent_dim = 32
     nav_scan_cnn_channels = [16, 32]
 
     # --- Saving
@@ -140,7 +140,7 @@ class NavConfig(StageConfig):
     # actor-side 1D CNN. No hand-crafted nav_sector features are appended.
     num_goal_obs = 4
     num_nav_scan_obs = 32
-    nav_scan_latent_dim = 16
+    nav_scan_latent_dim = 32
     nav_scan_cnn_channels = [16, 32]
     # critic: 316 (base) + 4 (goal) + 32 (raw nav scan) = 352
     # agent.py adds goal/raw nav dims automatically.

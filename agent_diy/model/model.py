@@ -92,9 +92,10 @@ class NavScanEncoder(nn.Module):
             layers.append(type(activation_fn)())
             in_channels = out_channels
 
-        layers.append(nn.AdaptiveAvgPool1d(1))
+        self.pool_bins = min(8, scan_dim)
+        layers.append(nn.AdaptiveAvgPool1d(self.pool_bins))
         layers.append(nn.Flatten())
-        layers.append(nn.Linear(in_channels, latent_dim))
+        layers.append(nn.Linear(in_channels * self.pool_bins, latent_dim))
         layers.append(type(activation_fn)())
 
         self.cnn = nn.Sequential(*layers)

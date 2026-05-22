@@ -29,6 +29,8 @@ class PolicyObservationProcess(ObservationProcess):
     """
 
     target_group = "policy"
+    goal_pos_scale = 10.0
+    goal_pos_clip = 20.0
 
     def _get_num_nav_scan_obs(self) -> int:
         """Read raw nav_scanner obs dim from the active stage config.
@@ -55,6 +57,8 @@ class PolicyObservationProcess(ObservationProcess):
         Stage3:   proprio(45) + height_scan(256) + goal(4) + raw_nav_scan(num_nav_scan_obs)
         """
         obs = self.default_observation()
+        goal_obs = None
+        nav_scan = None
 
         if self._get_num_goal_obs() > 0:
             goal_obs = self._goal_position_in_robot_frame()
@@ -111,8 +115,8 @@ class PolicyObservationProcess(ObservationProcess):
         cos_yaw = torch.cos(yaw)
         sin_yaw = torch.sin(yaw)
 
-        rel_x = cos_yaw * delta_world[:, 0] + sin_yaw * delta_world[:, 1]
-        rel_y = -sin_yaw * delta_world[:, 0] + cos_yaw * delta_world[:, 1]
+        rel_x_m = cos_yaw * delta_world[:, 0] + sin_yaw * delta_world[:, 1]
+        rel_y_m = -sin_yaw * delta_world[:, 0] + cos_yaw * delta_world[:, 1]
         rel_dist = torch.norm(delta_world, dim=1)
 
         goal_yaw = (
@@ -121,5 +125,10 @@ class PolicyObservationProcess(ObservationProcess):
             else torch.zeros(num_envs, device=device)
         )
         rel_yaw = wrap_to_pi(goal_yaw - yaw)
+
+        rel_x = rel_x_m.clamp(-self.goal_pos_clip, self.goal_pos_clip) / self.goal_pos_scale
+        rel_y = rel_y_m.clamp(-self.goal_pos_clip, self.goal_pos_clip) / self.goal_pos_scale
+        rel_dist = torch.tanh(rel_dist / self.goal_pos_scale)
+        rel_yaw = rel_yaw / torch.pi
 
         return torch.stack([rel_x, rel_y, rel_dist, rel_yaw], dim=-1)

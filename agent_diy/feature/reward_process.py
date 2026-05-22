@@ -54,6 +54,27 @@ class RewardProcess(RewardProcessBase):
     自定义奖励处理器，包含用户自定义的奖励项
     """
 
+    def _nav_scanner_blockage(self, obstacle_threshold: float = -0.3):
+        """Return far-field blockage ratios from nav_scanner, or None if missing."""
+        if "nav_scanner" not in self.env.scene.sensors:
+            return None
+
+        sensor = self.env.scene.sensors["nav_scanner"]
+        scan = sensor.data.pos_w[:, 2:3] - sensor.data.ray_hits_w[..., 2]
+        scan = scan.view(self.env.num_envs, -1)
+        blocked = (scan < obstacle_threshold).float()
+
+        n_rays = blocked.shape[1]
+        if n_rays < 2:
+            ratio = blocked.mean(dim=1)
+            return ratio, ratio, ratio
+
+        mid = n_rays // 2
+        left_blocked = blocked[:, :mid].mean(dim=1)
+        right_blocked = blocked[:, mid:].mean(dim=1)
+        blocked_ratio = blocked.mean(dim=1)
+        return blocked_ratio, left_blocked, right_blocked
+
     def _reward_flat_orientation(self):
         """Penalize non-flat base orientation (deviation from upright).
 
@@ -222,7 +243,14 @@ class RewardProcess(RewardProcessBase):
         # column-projection: for each y-strip, any obstacle in forward range?
         # 列投影：每个 y 条带在前方范围内是否存在障碍物
         col_blocked = (window < obstacle_threshold).any(dim=-1).float()
-        blocked = col_blocked.mean(dim=-1)
+        near_blocked = col_blocked.mean(dim=-1)
+
+        nav_stats = self._nav_scanner_blockage(obstacle_threshold)
+        if nav_stats is not None:
+            far_blocked, _, _ = nav_stats
+            blocked = torch.maximum(near_blocked, 0.75 * far_blocked)
+        else:
+            blocked = near_blocked
 
         # evasion signal: turning hard -> low penalty
         # 规避信号：转弯幅度大 -> 惩罚低
@@ -344,7 +372,16 @@ class RewardProcess(RewardProcessBase):
         grid = scan.view(self.env.num_envs, 16, 16)
         # Body-width forward window: Y[4:12], X[:8] (near-field ~0.8m)
         window = grid[:, 4:12, :8]
-        blocked_ratio = (window < obstacle_threshold).float().mean(dim=(1, 2))
+        near_blocked_ratio = (window < obstacle_threshold).float().mean(dim=(1, 2))
+
+        nav_stats = self._nav_scanner_blockage(obstacle_threshold)
+        if nav_stats is not None:
+            far_blocked_ratio, nav_left_blocked, nav_right_blocked = nav_stats
+            blocked_ratio = torch.maximum(near_blocked_ratio, 0.75 * far_blocked_ratio)
+        else:
+            nav_left_blocked = None
+            nav_right_blocked = None
+            blocked_ratio = near_blocked_ratio
         clear = (blocked_ratio < 0.15).float()
         blocked = 1.0 - clear
 
@@ -374,11 +411,18 @@ class RewardProcess(RewardProcessBase):
         # --- Blocked path: reward turning towards open side ---
         left_clear = (grid[:, 0:6, :8] < obstacle_threshold).float().mean(dim=(1, 2))
         right_clear = (grid[:, 10:16, :8] < obstacle_threshold).float().mean(dim=(1, 2))
-        # Desired turn: positive yaw_rate = turn left, negative = turn right
-        desired_sign = torch.where(left_clear < right_clear, -torch.ones(self.env.num_envs, device=device), torch.ones(self.env.num_envs, device=device))
-        # Also bias towards goal side
+        if nav_left_blocked is not None and nav_right_blocked is not None:
+            left_clear = torch.maximum(left_clear, nav_left_blocked)
+            right_clear = torch.maximum(right_clear, nav_right_blocked)
+        # Desired turn: positive yaw_rate = turn left, negative = turn right.
+        # Blend free-space preference with goal side so escape turns do not
+        # continue in a direction that obviously moves away from the exit.
+        clearance_delta = right_clear - left_clear
+        clearance_sign = torch.sign(clearance_delta)
         goal_sign = torch.sign(goal_angle)
-        desired_sign = torch.where(torch.abs(left_clear - right_clear) < 0.1, goal_sign, desired_sign)
+        desired_score = 0.65 * clearance_sign + 0.35 * goal_sign
+        desired_sign = torch.sign(desired_score)
+        desired_sign = torch.where(desired_sign == 0.0, goal_sign, desired_sign)
         yaw_rate = asset.data.root_ang_vel_b[:, 2]
         blocked_reward = torch.clamp(desired_sign * yaw_rate, min=0.0, max=1.5)
 
@@ -414,7 +458,7 @@ class RewardProcess(RewardProcessBase):
 
         return trapped * turn_reward
 
-    def _reward_wall_proximity_brake(self, obstacle_threshold: float = -0.3):
+    def _reward_wall_proximity_brake(self, obstacle_threshold: float = -0.3, far_scale: float = 0.35):
         """Penalize high forward speed when wall is detected nearby.
 
         近墙减速：前方近距离有墙时惩罚高前向速度。
@@ -433,6 +477,11 @@ class RewardProcess(RewardProcessBase):
         # Very near-field: body-width Y[4:12], X[:4] (0~0.4m ahead)
         near_window = grid[:, 4:12, :4]
         wall_proximity = (near_window < obstacle_threshold).float().mean(dim=(1, 2))
+
+        nav_stats = self._nav_scanner_blockage(obstacle_threshold)
+        if nav_stats is not None:
+            far_blocked, _, _ = nav_stats
+            wall_proximity = torch.maximum(wall_proximity, far_scale * far_blocked)
 
         # Penalize forward speed proportional to wall proximity
         fwd_speed = torch.clamp(asset.data.root_lin_vel_b[:, 0], min=0.0)

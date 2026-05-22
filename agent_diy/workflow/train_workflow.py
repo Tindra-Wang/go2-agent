@@ -79,6 +79,7 @@ def _initialize_training_state(env, agent, logger):
     obs = torch.clone(obs)
     critic_obs = torch.clone(critic_obs)
     logger.info(f"raw_obs.shape:{obs.shape}, critic_obs.shape:{critic_obs.shape}")
+    _log_obs_debug(logger, agent, obs, critic_obs, label="reset", step=0, interval=1)
 
     # 训练端 HIM 历史缓冲：(num_envs, history_len, proprio_dim)。
     # Train-side HIM history buffer; reset rows on dones during the rollout.
@@ -120,6 +121,42 @@ def _augment_obs_with_history(obs, history_buf):
     if history_buf is None:
         return obs
     return torch.cat([obs, history_buf.flatten(1)], dim=-1)
+
+
+def _tensor_sample(tensor, max_items=8):
+    if tensor is None or tensor.numel() == 0:
+        return []
+    return tensor.detach().flatten()[:max_items].cpu().tolist()
+
+
+def _log_obs_debug(logger, agent, obs, critic_obs, label, step, interval=200):
+    if logger is None or step % interval != 0:
+        return
+
+    base_dim = int(getattr(agent, "base_num_obs", obs.shape[-1]))
+    goal_dim = int(getattr(agent, "num_goal_obs", 0))
+    nav_dim = int(getattr(agent, "num_nav_scan_obs", 0))
+    core_dim = base_dim - goal_dim - nav_dim
+
+    parts = [
+        f"[DIY obs:{label}] step={step}",
+        f"obs.shape={tuple(obs.shape)}",
+        f"critic_obs.shape={tuple(critic_obs.shape)}",
+        f"core_dim={core_dim}",
+        f"goal_dim={goal_dim}",
+        f"nav_dim={nav_dim}",
+    ]
+
+    if obs.shape[0] > 0 and goal_dim > 0:
+        goal = obs[0, core_dim: core_dim + goal_dim]
+        parts.append(f"goal0={_tensor_sample(goal, goal_dim)}")
+    if obs.shape[0] > 0 and nav_dim > 0:
+        nav_start = core_dim + goal_dim
+        nav_scan = obs[:, nav_start: nav_start + nav_dim]
+        parts.append(f"nav_scan.shape={tuple(nav_scan.shape)}")
+        parts.append(f"nav_scan0_head={_tensor_sample(nav_scan[0], 8)}")
+
+    logger.info(" ".join(parts))
 
 
 def _push_history(history_buf, raw_proprio, dones=None):
@@ -604,6 +641,7 @@ def run_episodes_(
 
             data = env.step(command_actions)
             frame_no, next_obs, next_critic_obs, rewards, dones, infos = _process_env_step_result(data, episode, logger)
+            _log_obs_debug(logger, agent, next_obs, next_critic_obs, label="step", step=int(frame_no), interval=200)
             costs, cost_source = _derive_costs(infos, rewards, dones, agent, env=env)
             last_cost_source = cost_source
 
