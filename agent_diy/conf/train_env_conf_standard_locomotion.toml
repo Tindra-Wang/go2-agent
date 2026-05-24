@@ -1,10 +1,4 @@
 # =============================================================================
-# Standard Locomotion: locomotion training on a standard grid of mixed sub-terrains.
-# Standard Locomotion: 标准地形运动训练（多种子地形按比例混合）
-#
-# Based on  Stage1 + extra terms (termination / flat_orientation / feet_stumble).
-# 基于 Stage1 + 额外项（termination / flat_orientation / feet_stumble）
-# =============================================================================
 
 # === Basic Configuration ===
 # === 基础配置 ===

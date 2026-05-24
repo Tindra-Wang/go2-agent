@@ -47,8 +47,8 @@ class StageConfig:
     # --- Model architecture
     # 模型架构 ---
     model_class = "ActorCritic"
-    actor_hidden_dims = [512, 256, 128]
-    critic_hidden_dims = [512, 256, 128]
+    actor_hidden_dims = [512, 384, 256, 128]
+    critic_hidden_dims = [512, 384, 256, 128]
     activation = "elu"
 
     # --- Training hyperparameters
@@ -110,8 +110,8 @@ class StageConfig:
     # When enabled, policy obs is augmented by ``history_len * num_proprio_obs`` dims.
     use_history_encoder = True
     history_len = 10  # NP3O Go2ConstraintHimRoughCfg.env.history_len
-    history_latent_dim = 16
-    history_encoder_dims = [128, 64]
+    history_latent_dim = 32
+    history_encoder_dims = [256, 128, 64]
     nav_scan_latent_dim = 32
     nav_scan_cnn_channels = [16, 32]
 
@@ -142,8 +142,19 @@ class NavConfig(StageConfig):
     num_nav_scan_obs = 32
     nav_scan_latent_dim = 32
     nav_scan_cnn_channels = [16, 32]
-    # critic: 316 (base) + 4 (goal) + 32 (raw nav scan) = 352
-    # agent.py adds goal/raw nav dims automatically.
+    # Terrain context (2): [terrain_type_norm, segment_progress]
+    # Allows the policy to learn per-terrain strategies (e.g. take the side on stairs).
+    # 地形上下文 (2)：[地形类型归一值, 段内进度]
+    # 让策略学会不同地形不同走法（如楼梯走侧边）。
+    num_terrain_context_obs = 2
+    track_num_segments = 5  # must match terrain.track.track_length in TOML
+    # Maze nav hint (2): [best_passage_angle_norm, best_passage_score]
+    # Pre-computed from nav_scanner: which open passage best aligns with the goal direction.
+    # 迷宫导航提示 (2)：[最佳通道方向角, 通道质量分]
+    # nav_scanner 预计算：哪个开口最对准出口方向。
+    num_maze_nav_hint_obs = 2
+    # critic: 316 (base) + 2 (terrain) + 2 (maze) + 4 (goal) + 32 (raw nav scan) = 356
+    # agent.py adds goal/terrain/maze/raw nav dims automatically.
     num_critic_observations = 316
 
     # Fine-tune learning rate (lower than locomotion stage)
@@ -320,3 +331,4 @@ def _load_conf(conf_file, logger):
         config = user_config
 
     return config
+

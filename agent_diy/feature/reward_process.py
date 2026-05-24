@@ -428,6 +428,194 @@ class RewardProcess(RewardProcessBase):
 
         return clear * clear_reward + blocked * blocked_reward
 
+    def _reward_narrow_passage_alignment(
+        self,
+        obstacle_threshold: float = -0.3,
+        side_threshold: float = 0.2,
+        center_threshold: float = 0.12,
+        lateral_std: float = 0.35,
+        yaw_rate_std: float = 0.8,
+    ):
+        """Reward entering narrow passages while aligned with the goal direction."""
+        if not hasattr(self.env, "goal_positions") or self.env.goal_positions is None:
+            return torch.zeros(self.env.num_envs, device=self.env.device)
+
+        asset = self._get_robot_asset()
+        sensor = self.env.scene.sensors["height_scanner"]
+
+        scan = sensor.data.pos_w[:, 2:3] - sensor.data.ray_hits_w[..., 2]
+        grid = scan.view(self.env.num_envs, 16, 16)
+
+        forward_center = (grid[:, 6:10, 4:14] < obstacle_threshold).float().mean(dim=(1, 2))
+        left_side = (grid[:, 0:5, 4:14] < obstacle_threshold).float().mean(dim=(1, 2))
+        right_side = (grid[:, 11:16, 4:14] < obstacle_threshold).float().mean(dim=(1, 2))
+
+        side_walls = torch.minimum(left_side, right_side)
+        narrow_gate = torch.clamp((side_walls - side_threshold) / (1.0 - side_threshold), 0.0, 1.0)
+        center_clear_gate = torch.clamp((center_threshold - forward_center) / center_threshold, 0.0, 1.0)
+
+        robot_pos = asset.data.root_pos_w[:, :2]
+        goal_pos = self.env.goal_positions[:, :2]
+        delta_world = goal_pos - robot_pos
+        quat = asset.data.root_quat_w
+        yaw = torch.atan2(
+            2.0 * (quat[:, 0] * quat[:, 3] + quat[:, 1] * quat[:, 2]),
+            1.0 - 2.0 * (quat[:, 2] ** 2 + quat[:, 3] ** 2),
+        )
+        cos_yaw = torch.cos(yaw)
+        sin_yaw = torch.sin(yaw)
+        goal_body_x = cos_yaw * delta_world[:, 0] + sin_yaw * delta_world[:, 1]
+        goal_body_y = -sin_yaw * delta_world[:, 0] + cos_yaw * delta_world[:, 1]
+        goal_angle = torch.atan2(goal_body_y, goal_body_x)
+
+        heading_alignment = torch.clamp(torch.cos(goal_angle), min=0.0)
+        lateral_stability = torch.exp(-torch.abs(asset.data.root_lin_vel_b[:, 1]) / lateral_std)
+        yaw_stability = torch.exp(-torch.abs(asset.data.root_ang_vel_b[:, 2]) / yaw_rate_std)
+
+        return narrow_gate * center_clear_gate * heading_alignment * lateral_stability * yaw_stability
+
+    def _reward_narrow_passage_instability(
+        self,
+        obstacle_threshold: float = -0.3,
+        side_threshold: float = 0.2,
+        center_threshold: float = 0.12,
+        lateral_scale: float = 1.0,
+        yaw_rate_scale: float = 0.25,
+        forward_speed_threshold: float = 0.8,
+    ):
+        """Penalize side-slip, over-turning, and rushing inside narrow openings."""
+        asset = self._get_robot_asset()
+        sensor = self.env.scene.sensors["height_scanner"]
+
+        scan = sensor.data.pos_w[:, 2:3] - sensor.data.ray_hits_w[..., 2]
+        grid = scan.view(self.env.num_envs, 16, 16)
+
+        forward_center = (grid[:, 6:10, 4:14] < obstacle_threshold).float().mean(dim=(1, 2))
+        left_side = (grid[:, 0:5, 4:14] < obstacle_threshold).float().mean(dim=(1, 2))
+        right_side = (grid[:, 11:16, 4:14] < obstacle_threshold).float().mean(dim=(1, 2))
+
+        side_walls = torch.minimum(left_side, right_side)
+        narrow_gate = torch.clamp((side_walls - side_threshold) / (1.0 - side_threshold), 0.0, 1.0)
+        center_clear_gate = torch.clamp((center_threshold - forward_center) / center_threshold, 0.0, 1.0)
+
+        lateral_vel = asset.data.root_lin_vel_b[:, 1]
+        yaw_rate = asset.data.root_ang_vel_b[:, 2]
+        fwd_speed = torch.clamp(asset.data.root_lin_vel_b[:, 0] - forward_speed_threshold, min=0.0)
+        instability = lateral_scale * torch.square(lateral_vel) + yaw_rate_scale * torch.square(yaw_rate) + fwd_speed
+
+        return narrow_gate * center_clear_gate * instability
+
+    def _reward_goal_biased_corridor(
+        self,
+        obstacle_threshold: float = -0.3,
+        max_angle: float = 1.5708,
+        forward_speed_scale: float = 0.5,
+    ):
+        """Reward moving through open nav-scanner directions closest to the goal.
+
+        Gated to maze segment only: on stairs/slopes the terrain context lets the
+        policy learn terrain-adaptive strategies; in the maze the best strategy is
+        to follow passages that point toward the exit.
+        """
+        if not hasattr(self.env, "goal_positions") or self.env.goal_positions is None:
+            return torch.zeros(self.env.num_envs, device=self.env.device)
+        if "nav_scanner" not in self.env.scene.sensors:
+            return torch.zeros(self.env.num_envs, device=self.env.device)
+
+        asset = self._get_robot_asset()
+
+        # --- maze gate: only the last track segment ---
+        if hasattr(self.env.scene, "env_origins") and self.env.scene.env_origins is not None:
+            robot_pos = asset.data.root_pos_w
+            origins = self.env.scene.env_origins
+            track_start_x = origins[:, 0]
+            final_x = self.env.goal_positions[:, 0]
+            from agent_diy.conf.conf import Config
+
+            num_segments = int(getattr(Config.CURRENT, "track_num_segments", 5))
+            total_dx = torch.clamp(final_x - track_start_x, min=1.0)
+            segment_length = total_dx / num_segments
+            progress = torch.clamp(robot_pos[:, 0] - track_start_x, min=0.0)
+            segment_idx = torch.clamp((progress / segment_length).long(), 0, num_segments - 1)
+            in_maze = (segment_idx == num_segments - 1).float()
+        else:
+            in_maze = torch.ones(self.env.num_envs, device=self.env.device)
+
+        sensor = self.env.scene.sensors["nav_scanner"]
+        scan = sensor.data.pos_w[:, 2:3] - sensor.data.ray_hits_w[..., 2]
+        scan = scan.view(self.env.num_envs, -1)
+
+        n_rays = scan.shape[1]
+        ray_angles = torch.linspace(-max_angle, max_angle, n_rays, device=self.env.device)
+        clearance = (scan >= obstacle_threshold).float()
+
+        robot_pos = asset.data.root_pos_w[:, :2]
+        goal_pos = self.env.goal_positions[:, :2]
+        delta_world = goal_pos - robot_pos
+        quat = asset.data.root_quat_w
+        yaw = torch.atan2(
+            2.0 * (quat[:, 0] * quat[:, 3] + quat[:, 1] * quat[:, 2]),
+            1.0 - 2.0 * (quat[:, 2] ** 2 + quat[:, 3] ** 2),
+        )
+        cos_yaw = torch.cos(yaw)
+        sin_yaw = torch.sin(yaw)
+        goal_body_x = cos_yaw * delta_world[:, 0] + sin_yaw * delta_world[:, 1]
+        goal_body_y = -sin_yaw * delta_world[:, 0] + cos_yaw * delta_world[:, 1]
+        goal_angle = torch.atan2(goal_body_y, goal_body_x).clamp(-max_angle, max_angle)
+
+        goal_alignment = torch.clamp(torch.cos(ray_angles.unsqueeze(0) - goal_angle.unsqueeze(1)), min=0.0)
+        open_goal_score = clearance * goal_alignment
+        best_score = open_goal_score.max(dim=1).values
+
+        fwd_speed = torch.clamp(asset.data.root_lin_vel_b[:, 0], min=0.0, max=forward_speed_scale) / forward_speed_scale
+        return in_maze * best_score * fwd_speed
+
+    def _reward_terrain_adaptive_pathing(self, obstacle_threshold: float = -0.3):
+        """On pyramid terrains, reward seeking the lower side instead of climbing the centre.
+
+        All four non-maze segments (slope / inv_slope / stairs / inv_stairs):
+        the easiest path is always along the side of the track, not the centre.
+        Uses height_scanner to find the clearer side and reward lateral + forward
+        movement toward it.  Not active in maze.
+        """
+        if not hasattr(self.env, "goal_positions") or self.env.goal_positions is None:
+            return torch.zeros(self.env.num_envs, device=self.env.device)
+        if not hasattr(self.env.scene, "env_origins") or self.env.scene.env_origins is None:
+            return torch.zeros(self.env.num_envs, device=self.env.device)
+
+        asset = self._get_robot_asset()
+        robot_pos = asset.data.root_pos_w
+        origins = self.env.scene.env_origins
+
+        track_start_x = origins[:, 0]
+        final_x = self.env.goal_positions[:, 0]
+
+        from agent_diy.conf.conf import Config
+
+        num_segments = int(getattr(Config.CURRENT, "track_num_segments", 5))
+        total_dx = torch.clamp(final_x - track_start_x, min=1.0)
+        segment_length = total_dx / num_segments
+        progress = torch.clamp(robot_pos[:, 0] - track_start_x, min=0.0)
+        segment_idx = torch.clamp((progress / segment_length).long(), 0, num_segments - 1)
+
+        in_terrain = (segment_idx < num_segments - 1).float()
+
+        sensor = self.env.scene.sensors["height_scanner"]
+        scan = sensor.data.pos_w[:, 2:3] - sensor.data.ray_hits_w[..., 2]
+        grid = scan.view(self.env.num_envs, 16, 16)
+
+        left_clear = (grid[:, 0:6, 2:12] >= obstacle_threshold).float().mean(dim=(1, 2))
+        right_clear = (grid[:, 10:16, 2:12] >= obstacle_threshold).float().mean(dim=(1, 2))
+
+        lateral_vel = asset.data.root_lin_vel_b[:, 1]
+        fwd_speed = torch.clamp(asset.data.root_lin_vel_b[:, 0], min=0.0, max=1.0)
+
+        side_diff = right_clear - left_clear
+        lateral_bonus = torch.tanh(1.5 * side_diff * (-lateral_vel))
+        best_side_score = torch.maximum(left_clear, right_clear)
+
+        return in_terrain * best_side_score * (fwd_speed + 0.4 * lateral_bonus)
+
     def _reward_deadend_escape(self, obstacle_threshold: float = -0.3, trapped_threshold: float = 0.3):
         """Reward turning when trapped in a dead-end (nav_scanner wider range).
 

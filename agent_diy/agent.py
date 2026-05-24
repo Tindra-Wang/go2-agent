@@ -45,9 +45,11 @@ class Agent(BaseAgent):
         self.num_actions = stage.num_actions
         self.num_goal_obs = int(getattr(stage, "num_goal_obs", 0))
         self.num_nav_scan_obs = int(getattr(stage, "num_nav_scan_obs", 0))
-        self.num_critic_obs = int(stage.num_critic_observations) + self.num_goal_obs + self.num_nav_scan_obs
+        self.num_terrain_context_obs = int(getattr(stage, "num_terrain_context_obs", 0))
+        self.num_maze_nav_hint_obs = int(getattr(stage, "num_maze_nav_hint_obs", 0))
+        self.num_critic_obs = int(stage.num_critic_observations) + self.num_terrain_context_obs + self.num_maze_nav_hint_obs + self.num_goal_obs + self.num_nav_scan_obs
         self.proprio_dim = int(stage.num_proprio_obs)
-        self.base_num_obs = self.proprio_dim + int(stage.num_scan) + self.num_goal_obs + self.num_nav_scan_obs
+        self.base_num_obs = self.proprio_dim + int(stage.num_scan) + self.num_terrain_context_obs + self.num_maze_nav_hint_obs + self.num_goal_obs + self.num_nav_scan_obs
         self.history_len = int(getattr(stage, "history_len", 0)) if getattr(stage, "use_history_encoder", False) else 0
         self.num_obs = self.base_num_obs + self.history_len * self.proprio_dim
         self.num_steps_per_env = stage.num_steps_per_env

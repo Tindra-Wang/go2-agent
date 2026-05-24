@@ -50,7 +50,7 @@ num_rows = 10
 
 # In track mode, num_cols is the number of difficulty tiers (parallel lanes, l0 easiest, l9 hardest).
 # track 模式下 num_cols 代表难度档数（并行赛道数，l0 最简单，l9 最难）
-num_cols = 10
+num_cols = 18
 
 # Difficulty range [min, max], valid range: [0.0, 1.0].
 # 难度范围 [min, max]，合法范围：[0.0, 1.0]
@@ -340,6 +340,41 @@ weight = 3.5
 # Obstacle threshold (height delta in meters, negative = wall/pit).
 # 障碍判定阈值（高度差，米，负值 = 下凹/墙）
 obstacle_threshold = -0.3
+
+# Narrow-passage alignment: before entering a tight opening, align the body with
+# the goal direction and reduce side-slip / over-turning.
+# 窄通道对齐：进窄入口前先摆正机身，并减少横滑 / 过度转向。
+[rewards.narrow_passage_alignment]
+weight = 1.5
+[rewards.narrow_passage_alignment.params]
+obstacle_threshold = -0.3
+side_threshold = 0.2
+center_threshold = 0.12
+lateral_std = 0.35
+yaw_rate_std = 0.8
+
+# Narrow-passage instability: discourage side-slip, spinning, and rushing through
+# tight openings, which often leads to wall collisions in the maze.
+# 窄通道不稳定惩罚：抑制横滑、边转边挤和高速冲入口，减少迷宫撞墙。
+[rewards.narrow_passage_instability]
+weight = -0.5
+[rewards.narrow_passage_instability.params]
+obstacle_threshold = -0.3
+side_threshold = 0.2
+center_threshold = 0.12
+lateral_scale = 1.0
+yaw_rate_scale = 0.25
+forward_speed_threshold = 0.8
+
+# Goal-biased corridor: prefer open nav-scanner directions that also point toward
+# the goal, reducing safe-but-long detours inside the maze.
+# 目标偏置通道：优先选择既通畅又朝向目标的方向，减少迷宫内安全但绕远的路径。
+[rewards.goal_biased_corridor]
+weight = 0.5
+[rewards.goal_biased_corridor.params]
+obstacle_threshold = -0.3
+max_angle = 1.5708
+forward_speed_scale = 0.5
 
 # Fallback when blocked: reward turning (nav_scanner detects L-shaped turns 2.5m ahead).
 # 前方堵兜底：奖励转向（nav_scanner 2.5m 提前检测 L 型转角）
