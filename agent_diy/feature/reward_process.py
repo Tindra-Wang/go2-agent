@@ -142,7 +142,7 @@ class RewardProcess(RewardProcessBase):
         # Check which feet are in contact (3D force norm, max over history frames)
         # 检查哪些脚在接触地面（3D 力的范数，历史帧取最大值）
         contacts = (
-            contact_sensor.data.net_forces_w_history[:, :, sensor_cfg.body_ids, :].norm(dim=-1).max(dim=1)[0] > 1.0
+                contact_sensor.data.net_forces_w_history[:, :, sensor_cfg.body_ids, :].norm(dim=-1).max(dim=1)[0] > 1.0
         )
         # Get foot velocities (xy only)
         # 获取脚部速度（仅 xy 分量）
@@ -169,7 +169,7 @@ class RewardProcess(RewardProcessBase):
             torch.logical_or(cmd > 0.0, body_vel > velocity_threshold),
             reward,
             stand_still_scale * reward,
-        )
+            )
 
     # def _reward_standing_posture(self):
     #     """Reward maintaining default standing posture (for standing task)."""
@@ -193,13 +193,13 @@ class RewardProcess(RewardProcessBase):
     #     return linear_vel_penalty + angular_vel_penalty
 
     def _reward_obstacle_evasion(
-        self,
-        command_name: str = "base_velocity",
-        obstacle_threshold: float = -0.3,
-        near_x_end: int = 12,
-        body_y_start: int = 3,
-        body_y_end: int = 13,
-        turn_std: float = 0.5,
+            self,
+            command_name: str = "base_velocity",
+            obstacle_threshold: float = -0.3,
+            near_x_end: int = 12,
+            body_y_start: int = 3,
+            body_y_end: int = 13,
+            turn_std: float = 0.5,
     ):
         """Penalize forward-blocked path when robot is not actively turning.
 
@@ -395,7 +395,7 @@ class RewardProcess(RewardProcessBase):
         yaw = torch.atan2(
             2.0 * (quat[:, 0] * quat[:, 3] + quat[:, 1] * quat[:, 2]),
             1.0 - 2.0 * (quat[:, 2] ** 2 + quat[:, 3] ** 2),
-        )
+            )
         cos_yaw = torch.cos(yaw)
         sin_yaw = torch.sin(yaw)
         # World → body frame rotation (2D)
@@ -424,17 +424,17 @@ class RewardProcess(RewardProcessBase):
         desired_sign = torch.sign(desired_score)
         desired_sign = torch.where(desired_sign == 0.0, goal_sign, desired_sign)
         yaw_rate = asset.data.root_ang_vel_b[:, 2]
-        blocked_reward = torch.clamp(desired_sign * yaw_rate, min=0.0, max=1.5)
+        blocked_reward = torch.clamp(desired_sign * yaw_rate, min=0.0, max=1.0)
 
         return clear * clear_reward + blocked * blocked_reward
 
     def _reward_narrow_passage_alignment(
-        self,
-        obstacle_threshold: float = -0.3,
-        side_threshold: float = 0.2,
-        center_threshold: float = 0.12,
-        lateral_std: float = 0.35,
-        yaw_rate_std: float = 0.8,
+            self,
+            obstacle_threshold: float = -0.3,
+            side_threshold: float = 0.2,
+            center_threshold: float = 0.12,
+            lateral_std: float = 0.35,
+            yaw_rate_std: float = 0.8,
     ):
         """Reward entering narrow passages while aligned with the goal direction."""
         if not hasattr(self.env, "goal_positions") or self.env.goal_positions is None:
@@ -461,7 +461,7 @@ class RewardProcess(RewardProcessBase):
         yaw = torch.atan2(
             2.0 * (quat[:, 0] * quat[:, 3] + quat[:, 1] * quat[:, 2]),
             1.0 - 2.0 * (quat[:, 2] ** 2 + quat[:, 3] ** 2),
-        )
+            )
         cos_yaw = torch.cos(yaw)
         sin_yaw = torch.sin(yaw)
         goal_body_x = cos_yaw * delta_world[:, 0] + sin_yaw * delta_world[:, 1]
@@ -475,13 +475,13 @@ class RewardProcess(RewardProcessBase):
         return narrow_gate * center_clear_gate * heading_alignment * lateral_stability * yaw_stability
 
     def _reward_narrow_passage_instability(
-        self,
-        obstacle_threshold: float = -0.3,
-        side_threshold: float = 0.2,
-        center_threshold: float = 0.12,
-        lateral_scale: float = 1.0,
-        yaw_rate_scale: float = 0.25,
-        forward_speed_threshold: float = 0.8,
+            self,
+            obstacle_threshold: float = -0.3,
+            side_threshold: float = 0.2,
+            center_threshold: float = 0.12,
+            lateral_scale: float = 1.0,
+            yaw_rate_scale: float = 0.25,
+            forward_speed_threshold: float = 0.8,
     ):
         """Penalize side-slip, over-turning, and rushing inside narrow openings."""
         asset = self._get_robot_asset()
@@ -506,10 +506,10 @@ class RewardProcess(RewardProcessBase):
         return narrow_gate * center_clear_gate * instability
 
     def _reward_goal_biased_corridor(
-        self,
-        obstacle_threshold: float = -0.3,
-        max_angle: float = 1.5708,
-        forward_speed_scale: float = 0.5,
+            self,
+            obstacle_threshold: float = -0.3,
+            max_angle: float = 1.5708,
+            forward_speed_scale: float = 0.5,
     ):
         """Reward moving through open nav-scanner directions closest to the goal.
 
@@ -556,7 +556,7 @@ class RewardProcess(RewardProcessBase):
         yaw = torch.atan2(
             2.0 * (quat[:, 0] * quat[:, 3] + quat[:, 1] * quat[:, 2]),
             1.0 - 2.0 * (quat[:, 2] ** 2 + quat[:, 3] ** 2),
-        )
+            )
         cos_yaw = torch.cos(yaw)
         sin_yaw = torch.sin(yaw)
         goal_body_x = cos_yaw * delta_world[:, 0] + sin_yaw * delta_world[:, 1]
@@ -750,13 +750,13 @@ class RewardProcess(RewardProcessBase):
         return torch.sum(torch.square(asset.data.projected_gravity_b[:, :2]), dim=1) * self._upright_gate()
 
     def _reward_lateral_sway(
-        self,
-        command_name: str = "base_velocity",
-        command_threshold: float = 0.05,
-        forward_speed_threshold: float = 0.05,
-        lateral_vel_scale: float = 1.0,
-        roll_rate_scale: float = 0.25,
-        roll_tilt_scale: float = 1.0,
+            self,
+            command_name: str = "base_velocity",
+            command_threshold: float = 0.05,
+            forward_speed_threshold: float = 0.05,
+            lateral_vel_scale: float = 1.0,
+            roll_rate_scale: float = 0.25,
+            roll_tilt_scale: float = 1.0,
     ):
         """Penalize side-to-side sway without suppressing stair-climbing pitch.
 
@@ -775,9 +775,9 @@ class RewardProcess(RewardProcessBase):
         roll_tilt = asset.data.projected_gravity_b[:, 1]
 
         penalty = (
-            lateral_vel_scale * torch.square(lateral_vel)
-            + roll_rate_scale * torch.square(roll_rate)
-            + roll_tilt_scale * torch.square(roll_tilt)
+                lateral_vel_scale * torch.square(lateral_vel)
+                + roll_rate_scale * torch.square(roll_rate)
+                + roll_tilt_scale * torch.square(roll_tilt)
         )
         return penalty * moving_forward * self._upright_gate()
 
@@ -900,10 +900,10 @@ class RewardProcess(RewardProcessBase):
         return ((n_contact < 2).float()) * moving
 
     def _reward_feet_height_body(
-        self,
-        command_name: str = "base_velocity",
-        target_height: float = -0.30,
-        tanh_mult: float = 2.0,
+            self,
+            command_name: str = "base_velocity",
+            target_height: float = -0.30,
+            tanh_mult: float = 2.0,
     ):
         """Penalize swing-foot height (body z) vs target; aligns Isaac Lab feet_height_body.
 
@@ -998,11 +998,11 @@ class RewardProcess(RewardProcessBase):
     # 避免依赖私有 helper，保持 reward_process 仅扩展 NP3O 中本仓库未提供的项。
 
     def _reward_forward_velocity(
-        self,
-        command_name: str = "base_velocity",
-        max_speed: float = 1.0,
-        cmd_threshold: float = 0.05,
-        unconditional: bool = True,
+            self,
+            command_name: str = "base_velocity",
+            max_speed: float = 1.0,
+            cmd_threshold: float = 0.05,
+            unconditional: bool = True,
     ):
         """Dense reward for actual forward speed in body frame.
 

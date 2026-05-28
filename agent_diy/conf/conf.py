@@ -43,6 +43,10 @@ class StageConfig:
     num_goal_obs = 0  # optional goal observation dim / 可选 goal 观测维度
     num_nav_scan_obs = 0  # optional raw nav_scanner dim for 1D CNN / 可选 nav_scanner 原始序列维度
     num_critic_observations = 316  # proprio(45) + scan(256) + privileged(15)
+    # HeightScan 2D CNN config (16x16 grid → latent)
+    height_scan_latent_dim = 256  # 2D CNN output dim (64→256)
+    height_scan_cnn_channels = [16, 32, 64]  # Conv2d channel progression
+    use_height_scan_encoder = True  # 2D CNN encode height_scan before actor; False = raw passthrough
 
     # --- Model architecture
     # 模型架构 ---
@@ -104,14 +108,15 @@ class StageConfig:
     # Enable env-native computation of NP3O 3 named costs from robot state.
     use_native_costs = True
 
-    # --- HIM-lite history encoder (NP3O actor history) ---
-    # 历史编码器（NP3O actor 端历史观测，HIM-lite，无 contrastive loss）
+    # --- History encoder (NP3O actor history) ---
+    # 历史编码器（NP3O actor 端历史观测）
     # 注：开启后 obs 维度增加 ``history_len * num_proprio_obs``，与 NP3O 行为对齐。
     # When enabled, policy obs is augmented by ``history_len * num_proprio_obs`` dims.
     use_history_encoder = True
+    history_encoder_type = "gru"  # "gru" (default) or "mlp" (legacy)
     history_len = 10  # NP3O Go2ConstraintHimRoughCfg.env.history_len
     history_latent_dim = 32
-    history_encoder_dims = [256, 128, 64]
+    history_encoder_dims = [256, 128, 64]  # GRU: [gru_hidden, proj_hidden, proj_hidden]; MLP: as before
     nav_scan_latent_dim = 32
     nav_scan_cnn_channels = [16, 32]
 
@@ -147,7 +152,17 @@ class NavConfig(StageConfig):
     # 地形上下文 (2)：[地形类型归一值, 段内进度]
     # 让策略学会不同地形不同走法（如楼梯走侧边）。
     num_terrain_context_obs = 2
-    track_num_segments = 5  # must match terrain.track.track_length in TOML
+    # track_num_segments 从 TOML terrain.track.track_length 动态读取（见 Config.load_conf）
+    # track_num_segments is read dynamically from TOML terrain.track.track_length
+    track_num_segments = 5  # default fallback; overridden at runtime
+
+    # 泛化测试：在评估时覆盖地形难度（None = 不覆盖）
+    # Test generalization on unseen difficulty levels (e.g. 5)
+    test_difficulty_override: int | None = None
+    # 泛化测试时冻结哪些模块（"all" / "actor" / "" = 不冻结）
+    # Which modules to freeze during generalization test
+    test_freeze_modules: str = ""
+
     # Maze nav hint (2): [best_passage_angle_norm, best_passage_score]
     # Pre-computed from nav_scanner: which open passage best aligns with the goal direction.
     # 迷宫导航提示 (2)：[最佳通道方向角, 通道质量分]
@@ -172,6 +187,13 @@ class LocomotionConfig(StageConfig):
 
     name = "locomotion"
     task_type = "standard"
+
+    # Disable encoders for clean hot-start from reference checkpoint.
+    # Reference checkpoint was trained with raw height_scan + no history,
+    # so both must be off to match the original actor input distribution.
+    # 关闭编码器以对齐参考 checkpoint 的 actor 输入分布（原始 height_scan，无历史）。
+    use_history_encoder = False
+    use_height_scan_encoder = False
 
 
 class Config:
@@ -250,6 +272,21 @@ class Config:
             error_msg = f"usr_conf is None, please check {usr_conf_file}"
             logger.error(error_msg)
             raise Exception(error_msg)
+
+        # Dynamically read track_num_segments from TOML (no longer hardcoded)
+        # 从 TOML 动态读取 track_num_segments，不再硬编码
+        try:
+            terrain_cfg = usr_conf.get("terrain", {})
+            if terrain_cfg.get("mode") == "track":
+                track_cfg = terrain_cfg.get("track", {})
+                track_len = track_cfg.get("track_length", None)
+                if track_len is not None:
+                    Config.CURRENT.track_num_segments = int(track_len)
+                    logger.info(
+                        f"[dynamic] track_num_segments={track_len} (from TOML terrain.track.track_length)"
+                    )
+        except Exception:
+            pass  # keep hardcoded fallback
 
         logger.info(f"Stage: {stage.name}, task_type: {task_type}, model: {stage.model_class}")
 

@@ -63,13 +63,18 @@ class Agent(BaseAgent):
             actor_hidden_dims=stage.actor_hidden_dims,
             critic_hidden_dims=stage.critic_hidden_dims,
             activation=stage.activation,
+            init_noise_std=getattr(stage, "init_noise_std", 1.0),
             num_costs=stage.num_costs,
             history_len=self.history_len,
             proprio_dim=self.proprio_dim,
             history_latent_dim=int(getattr(stage, "history_latent_dim", 16)),
             history_encoder_dims=list(getattr(stage, "history_encoder_dims", [128, 64])),
+            history_encoder_type=getattr(stage, "history_encoder_type", "gru"),
             num_goal_obs=self.num_goal_obs,
             num_nav_scan_obs=self.num_nav_scan_obs,
+            height_scan_dim=int(stage.num_scan),
+            height_scan_latent_dim=int(getattr(stage, "height_scan_latent_dim", 256)),
+            height_scan_cnn_channels=list(getattr(stage, "height_scan_cnn_channels", [16, 32, 64])),
             nav_scan_latent_dim=int(getattr(stage, "nav_scan_latent_dim", 16)),
             nav_scan_cnn_channels=list(getattr(stage, "nav_scan_cnn_channels", [16, 32])),
         ).to(self.device)
@@ -251,3 +256,49 @@ class Agent(BaseAgent):
         )
         for info in partial_keys:
             self.logger.info(f"  Partial: {info}")
+
+    def freeze_for_test(self, modules: str = "all"):
+        """Freeze model modules for generalization testing on unseen difficulty.
+
+        冻结指定模块参数，在未训练难度上测试泛化能力。
+
+        Args:
+            modules: "all" = freeze everything; "actor" = freeze actor only;
+                     "encoder" = freeze all encoders; "" = no freeze.
+        """
+        if not modules:
+            return
+
+        freeze_map = {
+            "actor": [self.model.actor],
+            "height_scan_encoder": [self.model.height_scan_encoder],
+            "nav_scan_encoder": (
+                [self.model.nav_scan_encoder, self.model.critic_nav_scan_encoder,
+                 self.model.cost_nav_scan_encoder]
+                if self.model.nav_scan_encoder is not None else []
+            ),
+            "history_encoder": [self.model.history_encoder] if self.model.history_encoder is not None else [],
+        }
+
+        if modules == "all":
+            targets = []
+            for v in freeze_map.values():
+                targets.extend(v)
+        elif modules in freeze_map:
+            targets = freeze_map[modules]
+        else:
+            self.logger.warning(f"Unknown freeze_modules='{modules}', skipping freeze")
+            return
+
+        frozen_count = 0
+        for module in targets:
+            if module is None:
+                continue
+            module.eval()
+            for p in module.parameters():
+                p.requires_grad = False
+                frozen_count += 1
+        self.logger.info(
+            f"[freeze] modules='{modules}': {frozen_count} params frozen, "
+            f"difficulty_override={getattr(self.stage, 'test_difficulty_override', None)}"
+        )

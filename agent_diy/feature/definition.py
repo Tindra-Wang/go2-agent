@@ -38,15 +38,15 @@ class RolloutStorage:
             self.__init__()
 
     def __init__(
-        self,
-        num_envs,
-        num_transitions_per_env,
-        obs_shape,
-        privileged_obs_shape,
-        actions_shape,
-        num_costs,
-        cost_d_values=None,
-        device="cpu",
+            self,
+            num_envs,
+            num_transitions_per_env,
+            obs_shape,
+            privileged_obs_shape,
+            actions_shape,
+            num_costs,
+            cost_d_values=None,
+            device="cpu",
     ):
         self.device = device
         self.obs_shape = obs_shape
@@ -77,12 +77,12 @@ class RolloutStorage:
         self.step = 0
 
     def _init_buffers(
-        self,
-        num_transitions_per_env,
-        num_envs,
-        obs_shape,
-        privileged_obs_shape,
-        actions_shape,
+            self,
+            num_transitions_per_env,
+            num_envs,
+            obs_shape,
+            privileged_obs_shape,
+            actions_shape,
     ):
         shape = (num_transitions_per_env, num_envs)
 

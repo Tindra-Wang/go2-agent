@@ -33,21 +33,20 @@ def resolve_nn_activation(activation: str) -> nn.Module:
 
 
 class HistoryEncoder(nn.Module):
-    """HIM-lite history encoder.
+    """HIM-lite history encoder (MLP variant, kept for backward compatibility).
 
     历史观测编码器（NP3O HIM 简化版，无 contrastive loss）：
-    将 ``history_len`` 步 proprio 拼接展平后，经 MLP 压缩为 ``latent_dim`` 维潜变量，
-    再与当前 proprio + scan 拼接送入 actor，行为上等价于 NP3O 中
-    ``actor_student_backbone`` 的历史分支去掉对比学习头的版本。
+    将 ``history_len`` 步 proprio 拼接展平后，经 MLP 压缩为 ``latent_dim`` 维潜变量。
+    Legacy MLP path; prefer ``GRUHistoryEncoder`` for new training.
     """
 
     def __init__(
-        self,
-        history_len: int,
-        proprio_dim: int,
-        hidden_dims: list[int],
-        latent_dim: int,
-        activation_fn: nn.Module,
+            self,
+            history_len: int,
+            proprio_dim: int,
+            hidden_dims: list[int],
+            latent_dim: int,
+            activation_fn: nn.Module,
     ) -> None:
         super().__init__()
         layers: list[nn.Module] = []
@@ -66,6 +65,98 @@ class HistoryEncoder(nn.Module):
         return self.mlp(x)
 
 
+class GRUHistoryEncoder(nn.Module):
+    """GRU-based history encoder (replaces MLP for sequential proprioception).
+
+    用 GRU 替换 MLP 处理历史 proprio 序列：
+    - 输入: [B, history_len * proprio_dim] → reshape → [B, history_len, proprio_dim]
+    - GRU 逐帧编码，取末帧隐状态经 projection 得到 latent。
+    相比 MLP，GRU 天然建模时序依赖，参数更少且对 history_len 变化更鲁棒。
+    """
+
+    def __init__(
+            self,
+            history_len: int,
+            proprio_dim: int,
+            hidden_dims: list[int],
+            latent_dim: int,
+            activation_fn: nn.Module,
+            num_layers: int = 1,
+    ) -> None:
+        super().__init__()
+        self.history_len = history_len
+        self.proprio_dim = proprio_dim
+        self.latent_dim = latent_dim
+        # hidden_dims[0] as GRU hidden size; last element is projection hidden
+        gru_hidden = hidden_dims[0] if hidden_dims else 128
+        self.gru = nn.GRU(
+            input_size=proprio_dim,
+            hidden_size=gru_hidden,
+            num_layers=num_layers,
+            batch_first=True,
+        )
+        proj_layers: list[nn.Module] = []
+        in_dim = gru_hidden
+        for hidden in hidden_dims[1:]:
+            proj_layers.append(nn.Linear(in_dim, hidden))
+            proj_layers.append(type(activation_fn)())
+            in_dim = hidden
+        proj_layers.append(nn.Linear(in_dim, latent_dim))
+        self.proj = nn.Sequential(*proj_layers) if proj_layers else nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, history_len * proprio_dim]
+        x = x.view(-1, self.history_len, self.proprio_dim)
+        out, _ = self.gru(x)
+        last = out[:, -1, :]  # [B, gru_hidden]
+        return self.proj(last)
+
+
+class HeightScanEncoder(nn.Module):
+    """2D CNN encoder for 16x16 height_scanner grid.
+
+    将 16x16 height_scanner 经 2D CNN 压缩为 latent 后送入 actor。
+    输入: [B, 256] (flattened 16x16 grid)
+    输出: [B, latent_dim]
+    """
+
+    def __init__(
+            self,
+            grid_size: int = 16,
+            channels: list[int] | None = None,
+            latent_dim: int = 256,
+            activation_fn: nn.Module | None = None,
+    ) -> None:
+        super().__init__()
+        if channels is None:
+            channels = [16, 32, 64]
+        if activation_fn is None:
+            activation_fn = nn.ELU()
+
+        layers: list[nn.Module] = []
+        in_ch = 1
+        for out_ch in channels:
+            layers.append(nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1))
+            layers.append(type(activation_fn)())
+            in_ch = out_ch
+
+        self.pool_size = min(4, grid_size)
+        layers.append(nn.AdaptiveAvgPool2d(self.pool_size))
+        layers.append(nn.Flatten())
+        layers.append(nn.Linear(in_ch * self.pool_size * self.pool_size, latent_dim))
+        layers.append(type(activation_fn)())
+
+        self.cnn = nn.Sequential(*layers)
+        self.grid_size = grid_size
+        self.latent_dim = latent_dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, 256] → reshape → [B, 1, 16, 16]
+        if x.ndim == 1:
+            x = x.unsqueeze(0)
+        return self.cnn(x.view(-1, 1, self.grid_size, self.grid_size))
+
+
 class NavScanEncoder(nn.Module):
     """1D CNN encoder for raw nav_scanner rays.
 
@@ -73,11 +164,11 @@ class NavScanEncoder(nn.Module):
     """
 
     def __init__(
-        self,
-        scan_dim: int,
-        channels: list[int],
-        latent_dim: int,
-        activation_fn: nn.Module,
+            self,
+            scan_dim: int,
+            channels: list[int],
+            latent_dim: int,
+            activation_fn: nn.Module,
     ) -> None:
         super().__init__()
         if scan_dim <= 0:
@@ -112,25 +203,29 @@ class Model(nn.Module):
     is_recurrent = False
 
     def __init__(
-        self,
-        num_obs: int | None = None,
-        num_critic_obs: int | None = None,
-        num_actions: int | None = None,
-        actor_hidden_dims: tuple[int] | list[int] | None = None,
-        critic_hidden_dims: tuple[int] | list[int] | None = None,
-        activation: str | None = None,
-        init_noise_std: float = 1.0,
-        noise_std_type: str = "scalar",
-        num_costs: int | None = None,
-        history_len: int = 0,
-        proprio_dim: int | None = None,
-        history_latent_dim: int = 16,
-        history_encoder_dims: list[int] | tuple[int, ...] | None = None,
-        num_goal_obs: int = 0,
-        num_nav_scan_obs: int = 0,
-        nav_scan_latent_dim: int = 16,
-        nav_scan_cnn_channels: list[int] | tuple[int, ...] | None = None,
-        **kwargs: dict[str, Any],
+            self,
+            num_obs: int | None = None,
+            num_critic_obs: int | None = None,
+            num_actions: int | None = None,
+            actor_hidden_dims: tuple[int] | list[int] | None = None,
+            critic_hidden_dims: tuple[int] | list[int] | None = None,
+            activation: str | None = None,
+            init_noise_std: float = 1.0,
+            noise_std_type: str = "scalar",
+            num_costs: int | None = None,
+            history_len: int = 0,
+            proprio_dim: int | None = None,
+            history_latent_dim: int = 16,
+            history_encoder_dims: list[int] | tuple[int, ...] | None = None,
+            history_encoder_type: str = "gru",
+            num_goal_obs: int = 0,
+            num_nav_scan_obs: int = 0,
+            height_scan_dim: int = 256,
+            height_scan_latent_dim: int = 256,
+            height_scan_cnn_channels: list[int] | tuple[int, ...] | None = None,
+            nav_scan_latent_dim: int = 16,
+            nav_scan_cnn_channels: list[int] | tuple[int, ...] | None = None,
+            **kwargs: dict[str, Any],
     ) -> None:
         super(Model, self).__init__()
 
@@ -153,12 +248,13 @@ class Model(nn.Module):
         critic_hidden_dims = critic_hidden_dims or stage.critic_hidden_dims
         activation_fn = resolve_nn_activation(activation or stage.activation)
 
-        # History encoder (HIM-lite): obs 末尾追加 history_len*proprio_dim 维历史，
-        # 编码为 history_latent_dim 维潜变量后与当前观测拼接送入 actor。
+        # History encoder: GRU (default) or MLP (legacy).
+        # 历史编码器：GRU（默认）或 MLP（兼容旧版）。
         # critic 仍使用未增广的 critic_obs（NP3O 中 critic 端为特权观测，无需历史）。
         self.history_len = int(history_len) if history_len else 0
         self.proprio_dim = int(proprio_dim) if proprio_dim is not None else int(stage.num_proprio_obs)
         self.history_latent_dim = int(history_latent_dim)
+        encoder_type = history_encoder_type or getattr(stage, "history_encoder_type", "gru")
 
         history_total = self.history_len * self.proprio_dim
         if history_total > 0 and self.num_obs <= history_total:
@@ -166,6 +262,7 @@ class Model(nn.Module):
                 f"num_obs ({self.num_obs}) must exceed history_len*proprio_dim ({history_total})"
             )
         self.base_obs_dim = self.num_obs - history_total
+        # core_obs_dim = proprio + height_scan_raw (without goal/nav_scan/history)
         self.core_obs_dim = self.base_obs_dim - self.num_goal_obs - self.num_nav_scan_obs
         if self.core_obs_dim <= 0:
             raise ValueError(
@@ -174,15 +271,40 @@ class Model(nn.Module):
             )
         if self.history_len > 0:
             encoder_dims = list(history_encoder_dims or stage.history_encoder_dims)
-            self.history_encoder = HistoryEncoder(
-                history_len=self.history_len,
-                proprio_dim=self.proprio_dim,
-                hidden_dims=encoder_dims,
-                latent_dim=self.history_latent_dim,
+            if encoder_type == "gru":
+                self.history_encoder = GRUHistoryEncoder(
+                    history_len=self.history_len,
+                    proprio_dim=self.proprio_dim,
+                    hidden_dims=encoder_dims,
+                    latent_dim=self.history_latent_dim,
+                    activation_fn=activation_fn,
+                )
+            else:
+                self.history_encoder = HistoryEncoder(
+                    history_len=self.history_len,
+                    proprio_dim=self.proprio_dim,
+                    hidden_dims=encoder_dims,
+                    latent_dim=self.history_latent_dim,
+                    activation_fn=activation_fn,
+                )
+        else:
+            self.history_encoder = None
+
+        # HeightScan 2D CNN encoder: 16x16 grid → latent (actor side only)
+        # 将原始 height_scan(256) 替换为 2D CNN 编码后的 latent(256)，仅 actor 侧使用
+        self.height_scan_dim = int(height_scan_dim)
+        self.height_scan_latent_dim = int(height_scan_latent_dim)
+        self.use_height_scan_encoder = bool(getattr(stage, "use_height_scan_encoder", True))
+        if self.use_height_scan_encoder:
+            hscan_channels = list(height_scan_cnn_channels or getattr(stage, "height_scan_cnn_channels", None) or [16, 32, 64])
+            self.height_scan_encoder = HeightScanEncoder(
+                grid_size=16,
+                channels=hscan_channels,
+                latent_dim=self.height_scan_latent_dim,
                 activation_fn=activation_fn,
             )
         else:
-            self.history_encoder = None
+            self.height_scan_encoder = None
 
         if self.num_nav_scan_obs > 0:
             self.nav_scan_encoder = NavScanEncoder(
@@ -212,10 +334,13 @@ class Model(nn.Module):
             nav_actor_dim = 0
             nav_critic_dim = 0
 
-        # Actor input: [proprio+height_scan | history_latent | optional_extra | nav_scan_latent]
-        # 旧输入列保持在前面，方便从不带 raw nav_scanner 的 checkpoint 部分热加载。
+        # Actor input: [proprio | height_scan_latent | extra | history_latent | goal | nav_scan_latent]
+        # extra = terrain_context + maze_nav_hint (between height_scan and goal in core_obs)
+        # 用 2D CNN latent(256) 替换原始 height_scan(256)，维度不变。
         history_actor_dim = self.history_latent_dim if self.history_encoder is not None else 0
-        actor_input_dim = self.core_obs_dim + history_actor_dim + self.num_goal_obs + nav_actor_dim
+        extra_actor_dim = max(0, self.core_obs_dim - self.proprio_dim - self.height_scan_dim)
+        actor_input_dim = (self.proprio_dim + self.height_scan_latent_dim + extra_actor_dim
+                           + history_actor_dim + self.num_goal_obs + nav_actor_dim)
         critic_input_dim = self.critic_base_obs_dim + self.num_goal_obs + nav_critic_dim
 
         self.actor = self._build_mlp(actor_input_dim, actor_hidden_dims, self.num_actions, activation_fn)
@@ -275,23 +400,20 @@ class Model(nn.Module):
         return self.distribution.entropy().sum(dim=-1)
 
     def _actor_input(self, obs: torch.Tensor) -> torch.Tensor:
-        """Build actor input by encoding the trailing history slice when enabled.
+        """Build actor input with 2D CNN height scan + GRU history + 1D CNN nav scan.
 
-        编码末尾的历史片段，并与当前 proprio+scan 拼接，作为 actor 输入。
-        若未开启历史编码器，则原样返回。
-
-        Layout: obs = [proprio+height_scan | optional_extra | raw_nav_scan | history_raw]
-        Actor input = [proprio+height_scan | history_latent | optional_extra | nav_scan_latent]
-        旧输入列保持在前面，新增 CNN latent 放到最后以便部分热加载。
+        Obs layout: [proprio | height_scan_raw | extra(terrain+maze) | goal | nav_scan_raw | history_raw]
+        Actor input: [proprio | height_scan_latent | extra | history_latent | goal | nav_scan_latent]
         """
-        if self.history_encoder is None and self.nav_scan_encoder is None:
-            return obs
+        proprio = obs[..., :self.proprio_dim]
+        hscan_raw = obs[..., self.proprio_dim:self.proprio_dim + self.height_scan_dim]
+        hscan_latent = self.height_scan_encoder(hscan_raw) if self.height_scan_encoder is not None else hscan_raw
 
-        # Split raw obs layout:
-        # [proprio+height_scan | optional_extra | raw_nav_scan | history_raw]
-        # Actor input layout:
-        # [proprio+height_scan | history_latent | optional_extra | nav_scan_latent]
-        core = obs[..., :self.core_obs_dim]
+        # Extra terms (terrain_context, maze_nav_hint) between height_scan and goal
+        extra_start = self.proprio_dim + self.height_scan_dim
+        extra_end = self.core_obs_dim
+        extra = obs[..., extra_start:extra_end] if extra_end > extra_start else None
+
         offset = self.core_obs_dim
 
         if self.num_goal_obs > 0:
@@ -312,7 +434,9 @@ class Model(nn.Module):
             history = obs[..., offset:]
             history_latent = self.history_encoder(history)
 
-        terms = [core]
+        terms = [proprio, hscan_latent]
+        if extra is not None and extra.shape[-1] > 0:
+            terms.append(extra)
         if history_latent is not None:
             terms.append(history_latent)
         if goal is not None:
