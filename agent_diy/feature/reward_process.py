@@ -428,52 +428,6 @@ class RewardProcess(RewardProcessBase):
 
         return clear * clear_reward + blocked * blocked_reward
 
-    def _reward_narrow_passage_alignment(
-            self,
-            obstacle_threshold: float = -0.3,
-            side_threshold: float = 0.2,
-            center_threshold: float = 0.12,
-            lateral_std: float = 0.35,
-            yaw_rate_std: float = 0.8,
-    ):
-        """Reward entering narrow passages while aligned with the goal direction."""
-        if not hasattr(self.env, "goal_positions") or self.env.goal_positions is None:
-            return torch.zeros(self.env.num_envs, device=self.env.device)
-
-        asset = self._get_robot_asset()
-        sensor = self.env.scene.sensors["height_scanner"]
-
-        scan = sensor.data.pos_w[:, 2:3] - sensor.data.ray_hits_w[..., 2]
-        grid = scan.view(self.env.num_envs, 16, 16)
-
-        forward_center = (grid[:, 6:10, 4:14] < obstacle_threshold).float().mean(dim=(1, 2))
-        left_side = (grid[:, 0:5, 4:14] < obstacle_threshold).float().mean(dim=(1, 2))
-        right_side = (grid[:, 11:16, 4:14] < obstacle_threshold).float().mean(dim=(1, 2))
-
-        side_walls = torch.minimum(left_side, right_side)
-        narrow_gate = torch.clamp((side_walls - side_threshold) / (1.0 - side_threshold), 0.0, 1.0)
-        center_clear_gate = torch.clamp((center_threshold - forward_center) / center_threshold, 0.0, 1.0)
-
-        robot_pos = asset.data.root_pos_w[:, :2]
-        goal_pos = self.env.goal_positions[:, :2]
-        delta_world = goal_pos - robot_pos
-        quat = asset.data.root_quat_w
-        yaw = torch.atan2(
-            2.0 * (quat[:, 0] * quat[:, 3] + quat[:, 1] * quat[:, 2]),
-            1.0 - 2.0 * (quat[:, 2] ** 2 + quat[:, 3] ** 2),
-            )
-        cos_yaw = torch.cos(yaw)
-        sin_yaw = torch.sin(yaw)
-        goal_body_x = cos_yaw * delta_world[:, 0] + sin_yaw * delta_world[:, 1]
-        goal_body_y = -sin_yaw * delta_world[:, 0] + cos_yaw * delta_world[:, 1]
-        goal_angle = torch.atan2(goal_body_y, goal_body_x)
-
-        heading_alignment = torch.clamp(torch.cos(goal_angle), min=0.0)
-        lateral_stability = torch.exp(-torch.abs(asset.data.root_lin_vel_b[:, 1]) / lateral_std)
-        yaw_stability = torch.exp(-torch.abs(asset.data.root_ang_vel_b[:, 2]) / yaw_rate_std)
-
-        return narrow_gate * center_clear_gate * heading_alignment * lateral_stability * yaw_stability
-
     def _reward_narrow_passage_instability(
             self,
             obstacle_threshold: float = -0.3,

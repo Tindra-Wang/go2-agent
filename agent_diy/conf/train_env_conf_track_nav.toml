@@ -341,18 +341,6 @@ weight = 3.5
 # 障碍判定阈值（高度差，米，负值 = 下凹/墙）
 obstacle_threshold = -0.3
 
-# Narrow-passage alignment: before entering a tight opening, align the body with
-# the goal direction and reduce side-slip / over-turning.
-# 窄通道对齐：进窄入口前先摆正机身，并减少横滑 / 过度转向。
-[rewards.narrow_passage_alignment]
-weight = 1.5
-[rewards.narrow_passage_alignment.params]
-obstacle_threshold = -0.3
-side_threshold = 0.2
-center_threshold = 0.12
-lateral_std = 0.35
-yaw_rate_std = 0.8
-
 # Narrow-passage instability: discourage side-slip, spinning, and rushing through
 # tight openings, which often leads to wall collisions in the maze.
 # 窄通道不稳定惩罚：抑制横滑、边转边挤和高速冲入口，减少迷宫撞墙。
