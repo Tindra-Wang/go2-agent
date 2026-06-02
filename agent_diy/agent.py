@@ -169,6 +169,11 @@ class Agent(BaseAgent):
         self._eval_history = torch.cat([self._eval_history[:, 1:], proprio.unsqueeze(1)], dim=1)
 
     def exploit(self, list_obs_data):
+        """
+        评估的时候用的函数
+        :param list_obs_data:
+        :return:
+        """
         obs = list_obs_data[0] if isinstance(list_obs_data, (list, tuple)) else list_obs_data
         aug_obs = self._augment_obs_for_eval(obs)
         with torch.no_grad():

@@ -187,8 +187,7 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
         reward_keys,
         usr_conf,
         history_buf,
-    ) = _initialize_training_state(env, agent, logger)
-
+    ) = _initialize_training_state(env, agent, logger)   # 初始化环境
     last_obs, last_critic_obs = torch.clone(obs), torch.clone(critic_obs)
     last_report_monitor_time = 0
     episode = 0
@@ -381,54 +380,107 @@ def _try_get_robot_data(env):
 def _compute_native_costs(env, agent):
     """Compute NP3O 3 named costs (dof_pos_limits, torque_limit, dof_vel_limits).
 
-    Returns ``None`` if any required field is unavailable so callers can fall back.
-    完整复刻 ``LocomotionWithNP3O/envs/legged_robot.py`` 中三具名 cost 的计算口径，
-    并按 ``stage.cost_scale`` 缩放（≈ NP3O ``cost * dt``）。
+    The environment does not need to emit these costs in ``infos``. We read the
+    robot articulation state directly and derive one cost vector per env:
+    [joint-position violation, torque violation, joint-velocity violation].
+    返回形状为 ``(num_envs, 3)`` 的 cost；如果缺少关节位置或关节限位等关键字段，
+    返回 ``None`` 让上层决定如何处理。
     """
     data = _try_get_robot_data(env)
     if data is None:
         return None
 
+    # Soft-limit ratios. For position limits, a value below 1.0 shrinks the
+    # legal interval toward zero, so the cost is triggered before the hard
+    # simulator limit is reached.
+    # 软限位比例：位置限位使用 0.9 会把安全区间向 0 收窄，提前惩罚接近硬限位的关节。
     soft_pos = float(getattr(agent.stage, "soft_dof_pos_limit", 0.9))
     soft_tau = float(getattr(agent.stage, "soft_torque_limit", 1.0))
     soft_qd = float(getattr(agent.stage, "soft_dof_vel_limit", 1.0))
+    # Scale per-step cost to the same order as NP3O's cost * dt convention.
+    # 当前配置中通常为 0.02，用于把单步 cost 缩放到与约束阈值同量级。
     cost_scale = float(getattr(agent.stage, "cost_scale", 1.0))
 
+    # 1) Joint-position cost: sum how far each joint exceeds its softened
+    # lower/upper position limits.
+    # 关节位置代价：统计每个关节超出“软位置限位”的幅度并按环境求和。
     pos = getattr(data, "joint_pos", None)
     pos_lim = getattr(data, "joint_pos_limits", None)
     if pos is None or pos_lim is None:
         return None
+
+    # Isaac Lab may expose limits as (num_dof, 2). Expand to
+    # (num_envs, num_dof, 2) so it broadcasts against batched joint positions.
+    # Isaac Lab 有时给出无 batch 维的限位，这里扩展到每个并行环境一份。
     if pos_lim.ndim == 2:
         pos_lim = pos_lim.unsqueeze(0).expand(pos.shape[0], -1, -1)
+
+    # Example: lower=-1.0, upper=1.0, soft_pos=0.9 -> safe interval [-0.9, 0.9].
+    # 注意负下限乘 0.9 后会变成更靠近 0 的值，因此安全区间被收窄。
     soft_low = pos_lim[..., 0] * soft_pos
     soft_high = pos_lim[..., 1] * soft_pos
+
+    # Lower violation: positive only when pos < soft_low.
+    # 下界越界量：只有关节角小于软下界时才为正。
     out_low = -(pos - soft_low).clip(max=0.0)
+    # Upper violation: positive only when pos > soft_high.
+    # 上界越界量：只有关节角大于软上界时才为正。
     out_high = (pos - soft_high).clip(min=0.0)
     cost_pos = (out_low + out_high).sum(dim=1)
 
+    # 2) Torque cost: sum torque excess beyond the softened torque limits.
+    # 关节扭矩代价：统计 |tau| 超过软扭矩限位的部分。
+    # Different Isaac Lab versions expose torque fields under slightly
+    # different names, so read the commonly used names without changing logic.
+    # 不同版本字段名略有差异，这里只是在同一语义下读取可用字段。
     tau = getattr(data, "applied_torque", None)
     if tau is None:
         tau = getattr(data, "joint_effort", None)
+
     tau_lim = getattr(data, "joint_effort_limits", None)
     if tau_lim is None:
         tau_lim = getattr(data, "torque_limits", None)
+
     if tau is None or tau_lim is None:
+        # Torque data is optional in some env wrappers. If missing, keep this
+        # cost dimension inactive instead of fabricating a signal.
+        # 某些环境包装不暴露扭矩，缺失时该维 cost 置零。
         cost_torque = torch.zeros(pos.shape[0], device=pos.device, dtype=pos.dtype)
     else:
+        # Broadcast limits from (num_dof,) to (1, num_dof) when needed.
+        # 将无 batch 维的限位扩展为可广播形状。
         if tau_lim.ndim == 1:
             tau_lim = tau_lim.unsqueeze(0)
+        # Excess = max(|tau| - soft_limit, 0), summed over joints per env.
+        # 未超过软限位时为 0，超过部分按关节求和。
         cost_torque = (tau.abs() - tau_lim * soft_tau).clip(min=0.0).sum(dim=1)
 
+    # 3) Joint-velocity cost: sum velocity excess beyond softened velocity limits.
+    # 关节速度代价：统计 |qd| 超过软速度限位的部分。
     qd = getattr(data, "joint_vel", None)
     qd_lim = getattr(data, "joint_vel_limits", None)
+
     if qd is None or qd_lim is None:
+        # Missing velocity limits make this cost dimension inactive.
+        # 缺少速度或速度限位时，该维 cost 置零。
         cost_qd = torch.zeros(pos.shape[0], device=pos.device, dtype=pos.dtype)
     else:
+        # Broadcast limits from (num_dof,) to (1, num_dof) when needed.
+        # 将无 batch 维的限位扩展为可广播形状。
         if qd_lim.ndim == 1:
             qd_lim = qd_lim.unsqueeze(0)
+        # Cap each joint's per-step excess at 1.0 to keep rare velocity spikes
+        # from dominating the cost return.
+        # 单关节单步越界量最多记 1.0，避免偶发速度尖峰压垮 cost return。
         cost_qd = (qd.abs() - qd_lim * soft_qd).clip(min=0.0, max=1.0).sum(dim=1)
 
+    # Final layout must match stage.cost_names:
+    # [dof_pos_limits, torque_limit, dof_vel_limits].
+    # 返回顺序必须与 stage.cost_names 一致。
     costs = torch.stack([cost_pos, cost_torque, cost_qd], dim=-1) * cost_scale
+
+    # Keep storage/algorithm tensors on the agent device and in float32.
+    # 与 rollout storage / algorithm 使用同一设备和 dtype。
     return costs.to(device=agent.device, dtype=torch.float32)
 
 
@@ -582,7 +634,7 @@ def _update_episode_statistics(
 def _compute_advantages_and_returns(storage, agent, critic_obs, logger, cost_source):
     last_critic_obs = torch.clone(critic_obs)
     last_values = agent.algorithm.actor_critic.evaluate(last_critic_obs.detach()).detach()
-    last_cost_values = agent.algorithm.actor_critic.evaluate_cost(last_critic_obs.detach()).detach()
+    last_cost_values = agent.algorithm.actor_critic.evaluate_cost(last_critic_obs.detach()).detach()  #  NP3O改进的点 加入了 cost critic
     storage.compute_returns(last_values, agent.algorithm.gamma, agent.algorithm.lam)
     storage.compute_cost_returns(last_cost_values, agent.algorithm.gamma, agent.algorithm.lam)
 
@@ -634,12 +686,14 @@ def run_episodes_(
                 detach_obs,
                 detach_critic_obs,
             ) = predict_result
+            # 预测结果直接作为 env 的 action 输入；如果需要，环境或 wrapper 内部会做进一步的剪裁或处理。
             joint_actions = actions
             command_actions = torch.clip(joint_actions, -6.0, 6.0).to(agent.device)
             if i == 0:
                 logger.info(f"clipped_action:{command_actions}")
 
             data = env.step(command_actions)
+            # 输入指令给机器狗
             frame_no, next_obs, next_critic_obs, rewards, dones, infos = _process_env_step_result(data, episode, logger)
             _log_obs_debug(logger, agent, next_obs, next_critic_obs, label="step", step=int(frame_no), interval=200)
             costs, cost_source = _derive_costs(infos, rewards, dones, agent, env=env)
@@ -689,21 +743,6 @@ def run_episodes_(
             )
             storage.add_transitions(transition)
             transition.clear()
-
-            if i == 0:
-                info_keys = sorted(infos.keys()) if isinstance(infos, dict) else []
-                info_shapes = {}
-                if isinstance(infos, dict):
-                    for key, value in infos.items():
-                        if isinstance(value, torch.Tensor):
-                            info_shapes[key] = list(value.shape)
-                        else:
-                            info_shapes[key] = type(value).__name__
-                logger.info(
-                    f"rollout shapes: obs={detach_obs.shape}, critic_obs={detach_critic_obs.shape}, costs={costs.shape}, cost_source={cost_source}"
-                )
-                logger.info(f"rollout infos keys: {info_keys}")
-                logger.info(f"rollout infos shapes: {info_shapes}")
 
         storage_stats = _compute_advantages_and_returns(storage, agent, critic_obs, logger, last_cost_source)
         last_obs = torch.clone(obs)

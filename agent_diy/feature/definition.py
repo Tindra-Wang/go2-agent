@@ -17,9 +17,13 @@ ActData = create_cls(
     action=None,
 )
 
-
+# 对局数据存储器
+# 每局进行的交互数据（观测、动作、奖励等）会被存储在 RolloutStorage 中，供后续训练使用。
 class RolloutStorage:
     class Transition:
+        """
+        单局数据的载体
+        """
         def __init__(self):
             self.observations = None
             self.critic_observations = None

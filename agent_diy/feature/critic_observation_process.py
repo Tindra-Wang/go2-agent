@@ -84,10 +84,10 @@ class CriticObservationProcess(PolicyObservationProcess):
             return torch.zeros(num_envs, target_dim, device=device)
 
         sensor = env.scene.sensors["nav_scanner"]
-        scan = sensor.data.pos_w[:, 2:3] - sensor.data.ray_hits_w[..., 2]
+        scan = sensor.data.pos_w[:, 2:3] - sensor.data.ray_hits_w[..., 2]  # 到障碍物的距离
         scan = scan.reshape(num_envs, -1)
         scan = torch.nan_to_num(scan, nan=5.0, posinf=5.0, neginf=-1.0)
-        scan = (scan.clamp(-1.0, 5.0) + 1.0) / 6.0
+        scan = (scan.clamp(-1.0, 5.0) + 1.0) / 6.0  # 归一化
 
         if scan.shape[1] != target_dim:
             scan = F.interpolate(scan.unsqueeze(1), size=target_dim, mode="linear", align_corners=False).squeeze(1)
@@ -96,4 +96,5 @@ class CriticObservationProcess(PolicyObservationProcess):
 
     def _goal_position_in_robot_frame(self):
         """Compute final goal position relative to robot in body frame (4 dim)."""
+        """计算最终的目标位置相对于机器人的位置（4 维）。"""
         return super()._goal_position_in_robot_frame()
