@@ -418,4 +418,3 @@ Track 模式关注：
 | `docs/protocol.md` | reset / step 数据协议与访问示例 |
 | `docs/agent_description.md` | 智能体结构、算法、监控和评估配置 |
 
-如文档与代码实现存在差异，以当前代码为准。
